@@ -28,12 +28,12 @@ with a bounded `[futures](https://docs.rs/futures)` stream pipeline.
 types and bridges them to the audited `rasn` codecs for all BER on the wire.
 - `**[bytes](https://docs.rs/bytes)`** — reference-counted receive buffers avoid
 re-allocating a 64 KiB scratch buffer per datagram and make slicing cheap.
-- `**[sysinfo](https://docs.rs/sysinfo)**` — the live MIB modules read real OS
+- `**[sysinfo](https://docs.rs/sysinfo)`** — the live MIB modules read real OS
 data through one cross-platform crate, so the agent works on Linux, macOS and
 Windows (no `/proc` scraping).
 - **[RustCrypto](https://github.com/RustCrypto)** (`md-5`, `sha1`, `sha2`,
 `hmac`, `aes`, `cfb-mode`) for SNMPv3/USM, **[rustls](https://github.com/rustls/rustls)**
-for TLS, `**thiserror`** for errors, and `**tracing**` for all output.
+for TLS, `**thiserror`** for errors, and `**tracing`** for all output.
 
 ---
 
@@ -112,51 +112,6 @@ channel, but `tlstmCertToTSN` certificate→securityName mapping is not modelled
 - 🟡 Most concrete **MIB modules** beyond the system/IF/HOST-RESOURCES/UCD
 subsets above.
 - ⛔ Language bindings (`perl/`, `python/`).
-
----
-
-## Layout
-
-```
-net-snmp-rs/
-├── Cargo.toml                  # workspace
-├── Justfile                    # build / test / docker task runner
-├── Dockerfile                  # copy-only image: static musl binaries -> alpine
-├── docker-compose.yml          # snmpd agent + snmp-itest tester stack
-├── examples/                   # runnable library examples (crate: netsnmp-examples)
-├── mibs/                       # bundled Net-SNMP MIB text files
-└── crates/
-    ├── netsnmp/                # core library (libnetsnmp)
-    │   └── src/
-    │       ├── oid.rs          # Oid type
-    │       ├── value.rs        # typed values
-    │       ├── convert.rs      # domain <-> rasn wire-type bridges
-    │       ├── pdu.rs          # PDU & varbind
-    │       ├── message.rs      # v1/v2c framing
-    │       ├── usm/            # USM crypto: level/auth/privacy/user
-    │       ├── v3/             # v3 messages: wire/types/build/parse
-    │       ├── transport.rs    # async UDP/TCP + BER framing (bytes buffers)
-    │       ├── tls.rs          # TLS secure channel
-    │       ├── session/        # async client + V3Session
-    │       ├── smi/            # SMI MIB parser: lex/parse/resolve
-    │       ├── config/         # snmp.conf/snmpd.conf parser
-    │       └── mib.rs          # name registry + value formatting (async loader)
-    ├── netsnmp-agent/          # agent framework (libnetsnmpagent)
-    │   └── src/
-    │       ├── handler.rs       # MibHandler trait
-    │       ├── scalar.rs        # scalar / table / fn helpers
-    │       ├── registry.rs      # dispatch
-    │       ├── agent.rs         # serve loop (snmpd)
-    │       ├── trap/            # notification receiver (snmptrapd)
-    │       └── mibgroup/        # live system-data MIBs (via sysinfo)
-    │           ├── collector.rs # shared, throttled sysinfo snapshot
-    │           ├── system.rs    # mibII system group
-    │           ├── interfaces.rs# IF-MIB ifTable + ifXTable
-    │           ├── host.rs      # HOST-RESOURCES tables
-    │           └── ucd.rs       # UCD-SNMP-MIB
-    ├── netsnmp-apps/           # CLI tools (apps/) — src/bin/snmp*.rs
-    └── netsnmp-itest/          # end-to-end CLI integration runner (snmp-itest)
-```
 
 ---
 

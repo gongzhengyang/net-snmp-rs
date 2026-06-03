@@ -1,0 +1,26 @@
+[package]
+name = "netsnmp-apps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "SNMP command-line tools (apps/ equivalent): snmpget, snmpgetnext, snmpwalk, snmpset, snmpbulkget, snmpbulkwalk, snmptable, snmpstatus, snmpdelta, snmpdf, snmpps, snmpnetstat, snmptest, snmpusm, snmpvacm, snmptranslate, snmptrap, snmptrapd, snmpd"
+
+[dependencies]
+netsnmp = { workspace = true }
+netsnmp-agent = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive", "env"] }
+thiserror = "2"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rand = "0.10"
+itertools = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+netsnmp = { workspace = true }
+netsnmp-agent = { workspace = true }
+tokio = { version = "1", features = ["full"] }

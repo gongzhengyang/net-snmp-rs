@@ -1,0 +1,10 @@
+# Keep the build context small. Everything under target/ is excluded EXCEPT the
+# locally-built static musl release binaries that the Dockerfile copies into the
+# image (built by `just build-musl`). If you change the musl triple, update both
+# this file and the COPY path in the Dockerfile.
+target/
+!target/x86_64-unknown-linux-musl/release/
+**/*.rs.bk
+.gitignore
+*.md
+docs/

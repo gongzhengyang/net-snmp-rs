@@ -1,0 +1,50 @@
+[package]
+name = "netsnmp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Core SNMP protocol library (libnetsnmp equivalent): ASN.1 BER, OID, PDU, message, transport, session"
+
+[lib]
+name = "netsnmp"
+path = "src/lib.rs"
+
+[features]
+default = ["tls"]
+# Secure transport: SNMP over TLS (RFC 6353 transport channel) via rustls.
+tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile"]
+
+[dependencies]
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = { workspace = true }
+itertools = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+rasn = { workspace = true }
+rasn-smi = { workspace = true }
+rasn-snmp = { workspace = true }
+md-5 = "0.11"
+sha1 = "0.11"
+sha2 = "0.11"
+hmac = "0.13"
+digest = "0.11"
+aes = "0.9"
+cfb-mode = "0.9"
+cipher = "0.5"
+subtle = "2"
+rand = "0.10"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Self-signed certificate generation for TLS loopback tests.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }

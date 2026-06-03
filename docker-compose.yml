@@ -1,0 +1,53 @@
+# docker-compose stack for net-snmp-rs.
+#
+#   snmpd   -- the SNMP agent, built from this repo, listening on udp/161.
+#   tester  -- the same image, running the `snmp-itest` integration suite
+#              (crate netsnmp-itest) against snmpd.
+#
+# Build + run the whole integration test with:
+#
+#   just docker-test            # or: docker compose up --build \
+#                               #        --abort-on-container-exit \
+#                               #        --exit-code-from tester
+
+services:
+  snmpd:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # The image only copies locally-built binaries (see Dockerfile / just
+      # build-musl); the sole build arg is an optional Alpine package mirror.
+      # e.g. APK_MIRROR=mirrors.ustc.edu.cn just docker-test
+      args:
+        APK_MIRROR: ${APK_MIRROR:-}
+    image: net-snmp-rs:latest
+    container_name: net-snmp-rs-agent
+    command: ["snmpd", "0.0.0.0:161"]
+    environment:
+      RUST_LOG: info
+    networks:
+      - snmpnet
+
+  tester:
+    # Reuse the image built by the snmpd service.
+    image: net-snmp-rs:latest
+    container_name: net-snmp-rs-tester
+    depends_on:
+      - snmpd
+    environment:
+      AGENT: "snmpd:161"
+      COMMUNITY: "public"
+      # SNMPv3 credentials must match docker/etc-snmp/snmpd.conf's createUser.
+      SNMP_V3_USER: "bob"
+      SNMP_V3_AUTH_PROTO: "SHA"
+      SNMP_V3_AUTH_PASS: "authpassword"
+      SNMP_V3_PRIV_PROTO: "AES"
+      SNMP_V3_PRIV_PASS: "privpassword"
+      RUST_LOG: warn
+    command: ["snmp-itest"]
+    networks:
+      - snmpnet
+
+networks:
+  snmpnet:
+    driver: bridge

@@ -1,0 +1,18 @@
+[package]
+name = "netsnmp-itest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "End-to-end integration test runner for the net-snmp-rs command-line tools"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "snmp-itest"
+path = "src/main.rs"

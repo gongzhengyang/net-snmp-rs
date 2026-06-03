@@ -1,0 +1,23 @@
+[package]
+name = "netsnmp-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "SNMP agent framework (libnetsnmpagent equivalent): handler chain, MIB registry, in-memory MIB tree, snmpd loop"
+
+[lib]
+name = "netsnmp_agent"
+path = "src/lib.rs"
+
+[dependencies]
+netsnmp = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+tracing = { workspace = true }
+sysinfo = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

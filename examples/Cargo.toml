@@ -1,0 +1,62 @@
+[package]
+name = "netsnmp-examples"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "Runnable examples showing how to build on the netsnmp / netsnmp-agent libraries"
+
+# Example sources live directly in this directory (examples/*.rs) rather than the
+# default examples/examples/ nesting, so disable auto-discovery and list them.
+autoexamples = false
+
+[lib]
+name = "netsnmp_examples"
+path = "src/lib.rs"
+
+[dependencies]
+netsnmp = { workspace = true }
+netsnmp-agent = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+
+# --- client examples ---------------------------------------------------------
+[[example]]
+name = "client"
+path = "client.rs"
+
+[[example]]
+name = "v3_client"
+path = "v3_client.rs"
+
+[[example]]
+name = "bulkwalk"
+path = "bulkwalk.rs"
+
+# --- agent / notification examples -------------------------------------------
+[[example]]
+name = "agent"
+path = "agent.rs"
+
+[[example]]
+name = "trap_roundtrip"
+path = "trap_roundtrip.rs"
+
+# --- self-contained end-to-end ----------------------------------------------
+[[example]]
+name = "loopback"
+path = "loopback.rs"
+
+# --- MIB / low-level protocol ------------------------------------------------
+[[example]]
+name = "mib"
+path = "mib.rs"
+
+[[example]]
+name = "asn1"
+path = "asn1.rs"

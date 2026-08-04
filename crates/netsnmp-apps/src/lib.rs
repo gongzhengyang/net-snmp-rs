@@ -21,6 +21,7 @@ pub mod mgmt;
 mod mib;
 mod settings;
 pub mod table;
+pub mod translate_fmt;
 mod usm;
 mod value;
 

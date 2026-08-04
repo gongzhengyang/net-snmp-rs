@@ -71,3 +71,39 @@ async fn symbolic_formatting_with_real_mibs() {
     let sys: Oid = "1.3.6.1.2.1.1.1.0".parse().unwrap();
     assert_eq!(mib.format_oid(&sys), "sysDescr.0");
 }
+
+#[tokio::test]
+async fn semantic_object_defs_from_real_mibs() {
+    // Task 5.17: the structured OBJECT-TYPE definitions must be parsed and
+    // registered alongside the OID path. Skipped when the mibs/ fixture is
+    // absent (same guard as the other tests in this file).
+    let Some(dir) = mib_dir() else {
+        tracing::warn!("skipping: mibs/ directory not found");
+        return;
+    };
+
+    let mut mib = MibRegistry::with_builtins();
+    mib.load_dir(&dir).await.expect("load mibs dir");
+
+    // ifIndex (1.3.6.1.2.1.2.2.1.1) is read-only with SYNTAX InterfaceIndex.
+    let if_index: Oid = "1.3.6.1.2.1.2.2.1.1".parse().unwrap();
+    let def = mib.object_def(&if_index).expect("ifIndex object def");
+    assert_eq!(def.name, "ifIndex");
+    assert_eq!(def.max_access, netsnmp::smi::Access::ReadOnly);
+    assert_eq!(def.status, netsnmp::smi::Status::Current);
+    // It should not be writable.
+    assert!(!mib.is_writable(&if_index));
+
+    // ifAdminStatus is read-write and enumerated.
+    let if_admin: Oid = "1.3.6.1.2.1.2.2.1.7".parse().unwrap();
+    let admin_def = mib.object_def(&if_admin).expect("ifAdminStatus object def");
+    assert_eq!(admin_def.max_access, netsnmp::smi::Access::ReadWrite);
+    assert!(admin_def.enums.iter().any(|(_, n)| n == "up"));
+    assert!(mib.is_writable(&if_admin));
+
+    // The DisplayString textual convention must be registered.
+    let ds = mib
+        .textual_convention("DisplayString")
+        .expect("DisplayString TC");
+    assert_eq!(ds.display_hint.as_deref(), Some("255a"));
+}

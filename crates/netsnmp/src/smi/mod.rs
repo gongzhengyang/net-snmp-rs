@@ -26,7 +26,11 @@ use std::collections::HashMap;
 use crate::oid::Oid;
 
 pub use lex::{Tok, lex};
-pub use parse::{RawDef, parse_module};
+pub use parse::{
+    Access, BaseType, Constraint, Index, ObjectDef, RawDef, Status, Syntax, TextualConvention,
+    parse_constraint, parse_module, parse_object_defs, parse_object_defs_with_seeds,
+    parse_textual_conventions,
+};
 pub use resolve::{MibObject, resolve, resolve_with_seeds};
 
 /// Convenience: parse and resolve a single module's text.

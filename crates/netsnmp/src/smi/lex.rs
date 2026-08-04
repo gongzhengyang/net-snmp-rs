@@ -2,15 +2,19 @@
 //!
 //! Turns MIB module text into a flat [`Tok`] stream, applying the ASN.1 comment
 //! rule (`--` … `--`/EOL), the identifier rule (embedded single hyphens), and
-//! skipping quoted/bit-string literals.
+//! capturing quoted strings as [`Tok::Str`] (bit-string literals are skipped).
 
-/// A lexical token from a MIB file (quoted strings are skipped during lexing).
+/// A lexical token from a MIB file. Quoted strings are captured (with the
+/// surrounding quotes removed) as [`Tok::Str`]; the ASN.1 `""` escape is
+/// decoded back into a single `"` inside the captured content.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
     /// An identifier or keyword (e.g. `sysDescr`, `OBJECT-TYPE`, `mib-2`).
     Ident(String),
     /// A non-negative integer literal.
     Num(i64),
+    /// A double-quoted string literal (contents, with `""` decoded).
+    Str(String),
     /// `{`
     LBrace,
     /// `}`
@@ -62,13 +66,37 @@ pub fn lex(input: &str) -> Vec<Tok> {
                     i += 1;
                 }
             }
-            // Quoted string: skip entirely (may span lines).
+            // Quoted string: capture contents, decoding the ASN.1 `""` escape
+            // (two adjacent double-quotes inside a string → one literal `"`).
             b'"' => {
                 i += 1;
-                while i < len && bytes[i] != b'"' {
-                    i += 1;
+                let mut content = String::new();
+                loop {
+                    if i >= len {
+                        break;
+                    }
+                    if bytes[i] == b'"' {
+                        // `""` inside the string is an escaped quote.
+                        if i + 1 < len && bytes[i + 1] == b'"' {
+                            content.push('"');
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    // Consume one UTF-8 char boundary so non-ASCII text
+                    // (common in DESCRIPTIONs) is preserved correctly.
+                    let ch_start = i;
+                    let width = utf8_len(bytes[i]);
+                    let ch_end = (ch_start + width).min(len);
+                    match std::str::from_utf8(&bytes[ch_start..ch_end]) {
+                        Ok(s) => content.push_str(s),
+                        Err(_) => content.push('\u{FFFD}'),
+                    }
+                    i = ch_end;
                 }
                 i += 1; // closing quote (or EOF)
+                out.push(Tok::Str(content));
             }
             // Binary/hex string literal: '...'H or '...'B — skip.
             b'\'' => {
@@ -163,4 +191,20 @@ pub fn lex(input: &str) -> Vec<Tok> {
     }
 
     out
+}
+
+/// Return the expected UTF-8 byte width of a code point given its leading byte.
+/// Values 0x80–0xBF are continuation bytes (treated as width 1 to recover).
+fn utf8_len(first: u8) -> usize {
+    if first < 0x80 {
+        1
+    } else if first < 0xC0 {
+        1 // stray continuation byte
+    } else if first < 0xE0 {
+        2
+    } else if first < 0xF0 {
+        3
+    } else {
+        4
+    }
 }

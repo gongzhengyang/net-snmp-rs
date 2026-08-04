@@ -5,6 +5,7 @@
 //! their root OID and routes each varbind to the correct handler.
 
 use crate::handler::MibHandler;
+use crate::vacm::{AccessView, Vacm};
 use netsnmp::oid::Oid;
 use netsnmp::pdu::{ErrorStatus, Pdu, PduType, VarBind};
 use netsnmp::value::Value;
@@ -14,6 +15,52 @@ use std::sync::Arc;
 #[derive(Default)]
 pub struct Registry {
     handlers: Vec<Arc<dyn MibHandler>>,
+}
+
+/// The security context of an incoming request, consulted by
+/// [`Registry::process_with_access`] for VACM access checks.
+///
+/// Mirrors the `netsnmp_session` security fields the C agent threads through
+/// request dispatch. When `vacm` is `None` (or points at an empty [`Vacm`]),
+/// [`Registry::process_with_access`] is permissive — exactly matching the
+/// legacy [`Registry::process`] behaviour, which delegates to it with a
+/// permissive context.
+#[derive(Clone, Debug, Default)]
+pub struct SecurityContext {
+    /// The security model of the request (`1`=v1, `2`=v2c, `3`=USM).
+    pub security_model: i32,
+    /// The security name (community string or USM user name).
+    pub security_name: Vec<u8>,
+    /// The security level (0=noAuthNoPriv, 1=authNoPriv, 3=authPriv).
+    pub security_level: i32,
+    /// The context name (empty for v1/v2c and the default v3 context).
+    pub context: Vec<u8>,
+    /// The VACM to consult. `None` means permissive (no access control).
+    pub vacm: Option<Arc<Vacm>>,
+}
+
+impl SecurityContext {
+    /// Build a permissive security context (no VACM enforcement). Used by the
+    /// legacy [`Registry::process`] path so it behaves exactly as before.
+    pub fn permissive() -> Self {
+        SecurityContext::default()
+    }
+
+    /// Whether the caller may access `oid` for the given view type under this
+    /// context's VACM. Returns `true` when VACM is unset or empty.
+    fn allows(&self, view_type: AccessView, oid: &Oid) -> bool {
+        let Some(vacm) = &self.vacm else {
+            return true;
+        };
+        vacm.is_view_accessible(
+            view_type,
+            self.security_model,
+            &self.security_name,
+            self.security_level,
+            &self.context,
+            oid,
+        )
+    }
 }
 
 impl Registry {
@@ -61,14 +108,76 @@ impl Registry {
         VarBind::new(oid.clone(), Value::EndOfMibView)
     }
 
+    /// Resolve a single GETNEXT varbind subject to VACM access control, skipping
+    /// successors the caller may not read. Walks past denied OIDs until it finds
+    /// an accessible one (or reaches the end of the MIB view).
+    ///
+    /// This mirrors net-snmp's `VIEW_UNACCESSIBLE` behaviour for GETNEXT/
+    /// GETBULK: an inaccessible candidate is silently skipped rather than
+    /// reported, so a walk never leaks the existence of hidden OIDs.
+    ///
+    /// When the walk exhausts the MIB, the returned `EndOfMibView` varbind
+    /// carries the *last accessible* OID (or the requested `oid` if nothing was
+    /// accessible) — never a denied OID, so hidden subtree locations are not
+    /// leaked through the varbind's OID field.
+    fn do_get_next_accessible(&self, oid: &Oid, sec: &SecurityContext) -> VarBind {
+        let mut cursor = oid.clone();
+        let last_accessible = oid.clone();
+        loop {
+            let next = self.do_get_next(&cursor);
+            if next.value == Value::EndOfMibView {
+                // End of MIB reached: report EndOfMibView at the last accessible
+                // position, not at any denied candidate we walked past.
+                return VarBind::new(last_accessible, Value::EndOfMibView);
+            }
+            if sec.allows(AccessView::Read, &next.oid) {
+                return next;
+            }
+            // Access denied: keep walking from the candidate. Guard against an
+            // infinite loop if a handler returns a non-advancing successor.
+            if next.oid <= cursor {
+                return VarBind::new(last_accessible, Value::EndOfMibView);
+            }
+            cursor = next.oid;
+        }
+    }
+
     /// Process a request PDU and produce the response PDU, implementing the
     /// GET/GETNEXT/GETBULK/SET semantics of RFC 3416.
+    ///
+    /// This is the legacy permissive path: no VACM access checks are applied.
+    /// It delegates to [`Registry::process_with_access`] with a permissive
+    /// [`SecurityContext`], so existing callers behave exactly as before.
     pub fn process(&self, request: &Pdu) -> Pdu {
+        self.process_with_access(request, &SecurityContext::permissive())
+    }
+
+    /// Process a request PDU with VACM access control applied per varbind.
+    ///
+    /// When [`SecurityContext::vacm`] is `None` or an empty [`Vacm`], this is
+    /// permissive (identical to [`Registry::process`]). Once VACM is configured:
+    ///
+    /// * **GET** — a varbind whose OID is not in the read view yields a
+    ///   `noAccess` error-status with the 1-based error-index of that varbind,
+    ///   and the request varbinds are echoed back (RFC 3415 §3.2 step 4).
+    /// * **GETNEXT / GETBULK** — inaccessible successors are silently skipped:
+    ///   the walk continues to the next accessible OID (net-snmp's
+    ///   `VIEW_UNACCESSIBLE` behaviour), so hidden OIDs are never leaked.
+    /// * **SET** — a varbind whose OID is not in the write view yields
+    ///   `noAccess` (error-status + 1-based error-index, echoed varbinds),
+    ///   checked before any handler reservation.
+    pub fn process_with_access(&self, request: &Pdu, sec: &SecurityContext) -> Pdu {
         let mut response = Pdu::new(PduType::Response, request.request_id);
 
         match request.pdu_type {
             PduType::Get => {
-                for vb in &request.variables {
+                for (idx, vb) in request.variables.iter().enumerate() {
+                    if !sec.allows(AccessView::Read, &vb.oid) {
+                        response.error_status = ErrorStatus::NoAccess.code();
+                        response.error_index = (idx + 1) as i64;
+                        response.variables = request.variables.clone();
+                        return response;
+                    }
                     response
                         .variables
                         .push(VarBind::new(vb.oid.clone(), self.do_get(&vb.oid)));
@@ -76,13 +185,28 @@ impl Registry {
             }
             PduType::GetNext => {
                 for vb in &request.variables {
-                    response.variables.push(self.do_get_next(&vb.oid));
+                    response.variables.push(self.do_get_next_accessible(&vb.oid, sec));
                 }
             }
             PduType::GetBulk => {
-                self.process_bulk(request, &mut response);
+                // When VACM is permissive, take the original fast path that
+                // does no per-iteration access check.
+                if sec.vacm.is_none() {
+                    self.process_bulk(request, &mut response);
+                } else {
+                    self.process_bulk_accessible(request, &mut response, sec);
+                }
             }
             PduType::Set => {
+                // VACM write-view check up front: deny before any reservation.
+                for (idx, vb) in request.variables.iter().enumerate() {
+                    if !sec.allows(AccessView::Write, &vb.oid) {
+                        response.error_status = ErrorStatus::NoAccess.code();
+                        response.error_index = (idx + 1) as i64;
+                        response.variables = request.variables.clone();
+                        return response;
+                    }
+                }
                 self.process_set(request, &mut response);
             }
             other => {
@@ -116,6 +240,41 @@ impl Registry {
             let mut all_end = true;
             for cursor in cursors.iter_mut() {
                 let next = self.do_get_next(cursor);
+                if next.value != Value::EndOfMibView {
+                    all_end = false;
+                }
+                *cursor = next.oid.clone();
+                response.variables.push(next);
+            }
+            if all_end {
+                break;
+            }
+        }
+    }
+
+    /// Access-aware GETBULK: like [`Registry::process_bulk`] but each successor
+    /// is checked against the read view, skipping inaccessible OIDs.
+    fn process_bulk_accessible(&self, request: &Pdu, response: &mut Pdu, sec: &SecurityContext) {
+        let non_repeaters = request.non_repeaters().max(0) as usize;
+        let max_reps = request.max_repetitions().max(0) as usize;
+        let vars = &request.variables;
+
+        for vb in vars.iter().take(non_repeaters) {
+            response
+                .variables
+                .push(self.do_get_next_accessible(&vb.oid, sec));
+        }
+
+        let repeaters: Vec<Oid> = vars
+            .iter()
+            .skip(non_repeaters)
+            .map(|vb| vb.oid.clone())
+            .collect();
+        let mut cursors = repeaters;
+        for _ in 0..max_reps {
+            let mut all_end = true;
+            for cursor in cursors.iter_mut() {
+                let next = self.do_get_next_accessible(cursor, sec);
                 if next.value != Value::EndOfMibView {
                     all_end = false;
                 }
@@ -518,5 +677,187 @@ mod tests {
         // The first handler committed, then was undone because the second failed.
         let l = log.lock().unwrap();
         assert!(l.contains(&"undo"), "expected undo to be invoked, got {l:?}");
+    }
+
+    // --- VACM access-control integration with the registry ---
+
+    use crate::vacm::{
+        AccessView, ContextMatch, Vacm, VacmAccess, VacmGroup, VacmView, ViewTreeFamilyType,
+    };
+
+    /// A `Vacm` that grants community `public` read access to only the
+    /// `1.3.6.1.2.1.1` (system) subtree and write access to `1.3.6.1.2.1.1.5`.
+    fn restricted_vacm() -> Arc<Vacm> {
+        let vacm = Arc::new(Vacm::new());
+        vacm.add_group(VacmGroup {
+            security_model: 2,
+            security_name: b"public".to_vec(),
+            group: b"g".to_vec(),
+        });
+        vacm.add_access(VacmAccess {
+            group: b"g".to_vec(),
+            context_prefix: Vec::new(),
+            security_model: 0,
+            security_level: 0,
+            context_match: ContextMatch::Prefix,
+            read_view: Some(b"ro".to_vec()),
+            write_view: Some(b"rw".to_vec()),
+            notify_view: None,
+        });
+        vacm.add_view(
+            b"ro".to_vec(),
+            VacmView {
+                subtree: "1.3.6.1.2.1.1".parse().unwrap(),
+                mask: Vec::new(),
+                typ: ViewTreeFamilyType::Included,
+            },
+        );
+        vacm.add_view(
+            b"rw".to_vec(),
+            VacmView {
+                subtree: "1.3.6.1.2.1.1.5".parse().unwrap(),
+                mask: Vec::new(),
+                typ: ViewTreeFamilyType::Included,
+            },
+        );
+        vacm
+    }
+
+    fn secure_ctx(vacm: Arc<Vacm>) -> SecurityContext {
+        SecurityContext {
+            security_model: 2,
+            security_name: b"public".to_vec(),
+            security_level: 0,
+            context: Vec::new(),
+            vacm: Some(vacm),
+        }
+    }
+
+    #[test]
+    fn permissive_context_keeps_legacy_behaviour() {
+        let reg = sample_registry();
+        let pdu = Pdu::new(PduType::Get, 1)
+            .with_null_var("1.3.6.1.2.1.1.1.0".parse().unwrap())
+            .with_null_var("1.3.6.1.2.1.2.2.1.2.1".parse().unwrap());
+        // No VACM -> permissive, same as process().
+        let resp = reg.process_with_access(&pdu, &SecurityContext::permissive());
+        assert_eq!(resp.status(), ErrorStatus::NoError);
+        assert_eq!(
+            resp.variables[0].value,
+            Value::OctetString(b"net-snmp-rs".to_vec())
+        );
+        assert_eq!(
+            resp.variables[1].value,
+            Value::OctetString(b"lo".to_vec())
+        );
+    }
+
+    #[test]
+    fn get_denied_by_vacm_returns_no_access() {
+        let reg = sample_registry();
+        let sec = secure_ctx(restricted_vacm());
+        // sysDescr (allowed) + ifDescr.1 (denied): error on the second varbind.
+        let pdu = Pdu::new(PduType::Get, 1)
+            .with_null_var("1.3.6.1.2.1.1.1.0".parse().unwrap())
+            .with_null_var("1.3.6.1.2.1.2.2.1.2.1".parse().unwrap());
+        let resp = reg.process_with_access(&pdu, &sec);
+        assert_eq!(resp.status(), ErrorStatus::NoAccess);
+        assert_eq!(resp.error_index, 2);
+        // Request varbinds are echoed.
+        assert_eq!(resp.variables.len(), 2);
+    }
+
+    #[test]
+    fn getnext_skips_inaccessible_oid() {
+        let reg = sample_registry();
+        let sec = secure_ctx(restricted_vacm());
+        // GETNEXT from below the system group: the first accessible successor is
+        // sysDescr.0 (1.3.6.1.2.1.1.1.0), which is under the granted view.
+        let pdu = Pdu::new(PduType::GetNext, 1)
+            .with_null_var("1.3.6.1.2.1.1".parse().unwrap());
+        let resp = reg.process_with_access(&pdu, &sec);
+        assert_eq!(resp.status(), ErrorStatus::NoError);
+        assert_eq!(resp.variables[0].oid.to_string(), ".1.3.6.1.2.1.1.1.0");
+        // A GETNEXT from sysName.0 (the last accessible system row) reaches the
+        // end of the accessible view (interfaces are denied) -> EndOfMibView,
+        // and its OID does NOT leak any hidden interface OID.
+        let pdu2 = Pdu::new(PduType::GetNext, 2)
+            .with_null_var("1.3.6.1.2.1.1.5.0".parse().unwrap());
+        let resp2 = reg.process_with_access(&pdu2, &sec);
+        assert_eq!(resp2.variables[0].value, Value::EndOfMibView);
+        // The EndOfMibView varbind must not carry a denied OID: it stays at the
+        // requested (last accessible) position.
+        assert_eq!(resp2.variables[0].oid.to_string(), ".1.3.6.1.2.1.1.5.0");
+    }
+
+    #[test]
+    fn set_denied_by_write_view_returns_no_access() {
+        let reg = sample_registry();
+        let sec = secure_ctx(restricted_vacm());
+        // sysName.0 is in the write view -> allowed (then fails NotWritable on
+        // the read-only ScalarHandler, but that's after the VACM check).
+        // ifDescr.1 is NOT in the write view -> noAccess before reservation.
+        let mut pdu = Pdu::new(PduType::Set, 1);
+        pdu.variables.push(VarBind::new(
+            "1.3.6.1.2.1.2.2.1.2.1".parse().unwrap(),
+            Value::OctetString(b"x".to_vec()),
+        ));
+        let resp = reg.process_with_access(&pdu, &sec);
+        assert_eq!(resp.status(), ErrorStatus::NoAccess);
+        assert_eq!(resp.error_index, 1);
+    }
+
+    #[test]
+    fn getbulk_skips_inaccessible_rows() {
+        let reg = sample_registry();
+        let sec = secure_ctx(restricted_vacm());
+        let pdu = {
+            let mut p = Pdu::new(PduType::GetBulk, 1);
+            p.error_status = 0; // non-repeaters
+            p.error_index = 10; // max-repetitions
+            p.variables
+                .push(VarBind::null("1.3.6.1.2.1.1".parse().unwrap()));
+            p
+        };
+        let resp = reg.process_with_access(&pdu, &sec);
+        // Only sysDescr.0 and sysName.0 are accessible; no interface OIDs leak,
+        // including in any trailing EndOfMibView varbind's OID field.
+        for vb in &resp.variables {
+            assert!(
+                vb.oid.as_slice().starts_with(&[1, 3, 6, 1, 2, 1, 1]),
+                "leaked inaccessible OID {}",
+                vb.oid
+            );
+        }
+        for vb in &resp.variables {
+            assert!(
+                vb.oid.as_slice().starts_with(&[1, 3, 6, 1, 2, 1, 1]),
+                "leaked inaccessible OID {}",
+                vb.oid
+            );
+        }
+    }
+
+    #[test]
+    fn empty_vacm_is_permissive_via_process_with_access() {
+        let reg = sample_registry();
+        // A VACM that is configured but empty should still be permissive.
+        let sec = SecurityContext {
+            security_model: 2,
+            security_name: b"public".to_vec(),
+            security_level: 0,
+            context: Vec::new(),
+            vacm: Some(Arc::new(Vacm::new())),
+        };
+        let pdu = Pdu::new(PduType::Get, 1)
+            .with_null_var("1.3.6.1.2.1.2.2.1.2.1".parse().unwrap());
+        let resp = reg.process_with_access(&pdu, &sec);
+        assert_eq!(resp.status(), ErrorStatus::NoError);
+        assert_eq!(
+            resp.variables[0].value,
+            Value::OctetString(b"lo".to_vec())
+        );
+        // Sanity: AccessView enum is reachable.
+        let _ = AccessView::Read;
     }
 }

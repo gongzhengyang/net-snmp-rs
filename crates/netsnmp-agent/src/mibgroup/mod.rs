@@ -27,12 +27,14 @@ pub mod system;
 pub mod sysor;
 pub mod ucd;
 pub mod usm_stats;
+pub mod vacm;
 
 // Convenience re-exports so callers can write `mibgroup::SysOrTable` etc.
 pub use snmp_framework::{EngineSnapshot, EngineSnapshotProvider};
 pub use snmp_mpd::SnmpMpdStats;
 pub use sysor::SysOrTable;
 pub use usm_stats::UsmStats;
+pub use vacm::{register_vacm_mibs, vacm_handlers};
 
 use crate::registry::Registry;
 use std::sync::Arc;

@@ -46,6 +46,7 @@ pub mod registry;
 pub mod row;
 pub mod scalar;
 pub mod trap;
+pub mod vacm;
 
 pub use agent::{Agent, AgentConfig};
 pub use callback::CallbackBus;
@@ -55,11 +56,14 @@ pub use helpers::{
 };
 pub use mibgroup::{
     FrameworkMibConfig, SysOrTable, UsmStats, register_framework_mibs, register_system_mibs,
-    SystemMibConfig,
+    register_vacm_mibs, SystemMibConfig,
 };
-pub use registry::Registry;
+pub use registry::{Registry, SecurityContext};
 pub use row::RowStatus;
 pub use scalar::{FnHandler, MapHandler, ScalarHandler};
 pub use trap::{
     NotifyVersion, ReceivedNotification, TrapDisposition, TrapReceiver, TrapReceiverConfig,
+};
+pub use vacm::{
+    AccessView, ContextMatch, Vacm, VacmAccess, VacmGroup, VacmView, ViewTreeFamilyType,
 };

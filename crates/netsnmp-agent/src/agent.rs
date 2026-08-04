@@ -5,9 +5,10 @@
 //! and send back responses. Community authentication is checked here, mirroring
 //! the simple community ACL behaviour of the C agent's `snmpd.conf` rocommunity.
 
-use crate::registry::Registry;
+use crate::registry::{Registry, SecurityContext};
+use crate::vacm::Vacm;
 use netsnmp::error::{Error, Result};
-use netsnmp::message::Message;
+use netsnmp::message::{Message, Version};
 use netsnmp::usm::UsmUser;
 use netsnmp::v3::{self, EngineParams, HeaderData, UsmSecurityParameters, UsmStat};
 use std::collections::HashMap;
@@ -35,6 +36,11 @@ pub struct AgentConfig {
     pub engine_boots: u32,
     /// Configured SNMPv3/USM users (empty disables v3).
     pub users: Vec<UsmUser>,
+    /// Optional VACM (RFC 3415) access-control state. When `None` or when the
+    /// [`Vacm`] is empty, the agent is permissive (backwards compatible —
+    /// authentication alone gates access, exactly as before). Supply a
+    /// populated `Vacm` to enforce per-view read/write/notify ACLs.
+    pub vacm: Option<Arc<Vacm>>,
 }
 
 impl Default for AgentConfig {
@@ -45,6 +51,7 @@ impl Default for AgentConfig {
             engine_id: default_engine_id(),
             engine_boots: 1,
             users: Vec::new(),
+            vacm: None,
         }
     }
 }
@@ -66,6 +73,10 @@ pub struct Agent {
     boot_time: Instant,
     /// Running USM error counter reported in `usmStats` Report PDUs.
     usm_stats: AtomicU32,
+    /// The VACM access-control state. Defaults to an empty (permissive) `Vacm`
+    /// so that agents constructed without VACM behave exactly as before. When
+    /// non-empty, per-varbind read/write/notify views are enforced.
+    vacm: Arc<Vacm>,
 }
 
 impl Agent {
@@ -76,13 +87,30 @@ impl Agent {
             .iter()
             .map(|u| (u.name.as_bytes().to_vec(), u.clone()))
             .collect();
+        let vacm = config.vacm.clone().unwrap_or_else(|| Arc::new(Vacm::new()));
         Agent {
             registry: Arc::new(registry),
             config,
             users,
             boot_time: Instant::now(),
             usm_stats: AtomicU32::new(0),
+            vacm,
         }
+    }
+
+    /// Attach a [`Vacm`] to this agent, replacing any existing one. The agent
+    /// takes a clone of the [`Arc`] so callers may keep their own handle for
+    /// runtime mutation (e.g. via `snmpvacm` SET).
+    pub fn with_vacm(mut self, vacm: Arc<Vacm>) -> Self {
+        self.vacm = vacm;
+        self
+    }
+
+    /// Borrow the agent's VACM state. The returned [`Vacm`] is shared with the
+    /// request dispatch path, so mutations through its `add_*`/`remove_*`
+    /// methods take effect immediately for subsequent requests.
+    pub fn vacm(&self) -> &Vacm {
+        &self.vacm
     }
 
     /// Borrow the registry (e.g. to mutate handlers before serving — note the
@@ -145,7 +173,21 @@ impl Agent {
             return Ok(None);
         }
         trace!(pdu_type = ?msg.pdu.pdu_type, request_id = msg.pdu.request_id, "dispatching community request");
-        let response_pdu = self.registry.process(&msg.pdu);
+        // Map the SNMP version onto a VACM security model: v1 -> 1, v2c -> 2.
+        // (v3 never reaches this path.) The security name is the community
+        // string and the security level is noAuthNoPriv (0).
+        let security_model = match msg.version {
+            Version::V1 => 1,
+            _ => 2,
+        };
+        let sec = SecurityContext {
+            security_model,
+            security_name: msg.community.clone(),
+            security_level: 0,
+            context: Vec::new(),
+            vacm: Some(Arc::clone(&self.vacm)),
+        };
+        let response_pdu = self.registry.process_with_access(&msg.pdu, &sec);
         let response = Message::new(msg.version, msg.community, response_pdu);
         Ok(Some(response.encode()?))
     }
@@ -240,8 +282,22 @@ impl Agent {
         }
 
         // Dispatch the inner PDU and build an authenticated/encrypted response
-        // at the same security level the request used.
-        let response_pdu = self.registry.process(&msg.scoped.pdu);
+        // at the same security level the request used. VACM is consulted with
+        // the USM security context: model 3, the user name as security name,
+        // the request's security level, and the scoped PDU's context name.
+        let security_level = match user.security_level() {
+            netsnmp::usm::SecurityLevel::NoAuthNoPriv => 0,
+            netsnmp::usm::SecurityLevel::AuthNoPriv => 1,
+            netsnmp::usm::SecurityLevel::AuthPriv => 3,
+        };
+        let sec = SecurityContext {
+            security_model: 3,
+            security_name: user.name.as_bytes().to_vec(),
+            security_level,
+            context: msg.scoped.context_name.clone(),
+            vacm: Some(Arc::clone(&self.vacm)),
+        };
+        let response_pdu = self.registry.process_with_access(&msg.scoped.pdu, &sec);
         let reply = v3::build_response(
             header.msg_id,
             user,

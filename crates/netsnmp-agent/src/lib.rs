@@ -11,6 +11,8 @@
 //! | [`registry`]  | `agent/agent_registry.c`, `snmp_agent.c`   |
 //! | [`agent`]     | `agent/snmpd.c` (the daemon run-loop)      |
 //! | [`trap`]      | `apps/snmptrapd*.c` (notification receiver)|
+//! | [`row`]       | RFC 2579 RowStatus textual convention      |
+//! | [`helpers`]   | `agent/helpers/` (table, watcher, ...)     |
 //! | [`mibgroup`]  | `agent/mibgroup/` (live system-data MIBs)  |
 //!
 //! ## Example
@@ -38,19 +40,25 @@
 pub mod agent;
 pub mod callback;
 pub mod handler;
+pub mod helpers;
 pub mod mibgroup;
 pub mod registry;
+pub mod row;
 pub mod scalar;
 pub mod trap;
 
 pub use agent::{Agent, AgentConfig};
 pub use callback::CallbackBus;
-pub use handler::{MibHandler, Mode, Reading};
+pub use handler::{MibHandler, Mode, Reading, SetPhase};
+pub use helpers::{
+    CacheHandler, ColumnMeta, ReadOnly, Row, TableDataSet, TableHandler, Watcher, read_only,
+};
 pub use mibgroup::{
     FrameworkMibConfig, SysOrTable, UsmStats, register_framework_mibs, register_system_mibs,
     SystemMibConfig,
 };
 pub use registry::Registry;
+pub use row::RowStatus;
 pub use scalar::{FnHandler, MapHandler, ScalarHandler};
 pub use trap::{
     NotifyVersion, ReceivedNotification, TrapDisposition, TrapReceiver, TrapReceiverConfig,

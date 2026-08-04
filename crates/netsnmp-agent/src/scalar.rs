@@ -21,6 +21,40 @@ use std::time::{Duration, Instant};
 /// underlying collector's refresh interval so freshness is unaffected.
 const SNAPSHOT_TTL: Duration = Duration::from_millis(900);
 
+/// Whether two values share a compatible SMI base type, for the purposes of
+/// SET validation. Mirrors the loose type-check the C agent performs in
+/// reserve1: an INTEGER-compatible value can replace another INTEGER-compatible
+/// value (Integer, Counter32, Gauge32, TimeTicks, Counter64), and an
+/// OCTET-STRING-compatible value can replace another
+/// (OctetString, Oid, IpAddress, Opaque). NULL/exception values are not
+/// acceptable SET targets.
+pub(crate) fn types_compatible(current: &Value, new: &Value) -> bool {
+    match (current, new) {
+        // Exception/NULL sentinels are never valid SET values.
+        (_, Value::Null)
+        | (_, Value::NoSuchObject)
+        | (_, Value::NoSuchInstance)
+        | (_, Value::EndOfMibView)
+        | (Value::Null, _)
+        | (Value::NoSuchObject, _)
+        | (Value::NoSuchInstance, _)
+        | (Value::EndOfMibView, _) => false,
+        // INTEGER family: Integer, Counter32, Gauge32, TimeTicks, Counter64.
+        (Value::Integer(_), Value::Integer(_)) => true,
+        (Value::Counter32(_), Value::Counter32(_)) => true,
+        (Value::Gauge32(_), Value::Gauge32(_)) => true,
+        (Value::TimeTicks(_), Value::TimeTicks(_)) => true,
+        (Value::Counter64(_), Value::Counter64(_)) => true,
+        // OctetString-family.
+        (Value::OctetString(_), Value::OctetString(_)) => true,
+        (Value::Oid(_), Value::Oid(_)) => true,
+        (Value::IpAddress(_), Value::IpAddress(_)) => true,
+        (Value::Opaque(_), Value::Opaque(_)) => true,
+        // Different variants are incompatible.
+        _ => false,
+    }
+}
+
 /// A sorted set of instance cells, shared cheaply across requests.
 type CellSnapshot = Arc<Vec<(Oid, Value)>>;
 
@@ -165,6 +199,31 @@ impl MibHandler for ScalarHandler {
         *self.value.write().unwrap() = value.clone();
         Ok(())
     }
+
+    fn prepare_set(&self, oid: &Oid, value: &Value) -> Result<(), ErrorStatus> {
+        if !self.writable {
+            return Err(ErrorStatus::NotWritable);
+        }
+        if oid != &self.instance {
+            // The scalar is a single object at root.0; any other instance is a
+            // creation attempt, which a plain scalar does not support.
+            return Err(ErrorStatus::NoCreation);
+        }
+        // Reject obvious type mismatches up front (reserve phase). This is the
+        // minimal cross-type check: same SMI base type. Anything that survives
+        // here is accepted for commit.
+        let current = self.value.read().unwrap();
+        if !types_compatible(&current, value) {
+            return Err(ErrorStatus::WrongType);
+        }
+        Ok(())
+    }
+
+    fn commit_set(&self, oid: &Oid, value: &Value) -> Result<(), ErrorStatus> {
+        // Delegate to the legacy single-step setter: same writable/existence
+        // checks, then apply.
+        self.set(oid, value)
+    }
 }
 
 /// A handler backing an arbitrary set of instance OIDs with in-memory values,
@@ -241,6 +300,26 @@ impl MibHandler for MapHandler {
             None => Err(ErrorStatus::NoCreation),
         }
     }
+
+    fn prepare_set(&self, oid: &Oid, value: &Value) -> Result<(), ErrorStatus> {
+        if !self.writable {
+            return Err(ErrorStatus::NotWritable);
+        }
+        let entries = self.entries.read().unwrap();
+        match entries.get(oid) {
+            // Existing instance: validate the new value's type matches.
+            Some(current) if !types_compatible(current, value) => {
+                Err(ErrorStatus::WrongType)
+            }
+            Some(_) => Ok(()),
+            // Unknown instance: a plain map does not create rows via SET.
+            None => Err(ErrorStatus::NoCreation),
+        }
+    }
+
+    fn commit_set(&self, oid: &Oid, value: &Value) -> Result<(), ErrorStatus> {
+        self.set(oid, value)
+    }
 }
 
 #[cfg(test)]
@@ -311,5 +390,54 @@ mod tests {
             h.get(&root.child(0)),
             Some(Value::OctetString(b"new".to_vec()))
         );
+    }
+
+    #[test]
+    fn scalar_prepare_set_rejects_wrong_type() {
+        let root: Oid = "1.3.6.1.2.1.1.7".parse().unwrap();
+        let h = ScalarHandler::new(root.clone(), Value::OctetString(b"old".to_vec())).writable();
+        // Integer onto an OctetString scalar: reserve must reject.
+        let err = h
+            .prepare_set(&root.child(0), &Value::Integer(7))
+            .unwrap_err();
+        assert_eq!(err, ErrorStatus::WrongType);
+        // And the value is unchanged.
+        assert_eq!(
+            h.get(&root.child(0)),
+            Some(Value::OctetString(b"old".to_vec()))
+        );
+    }
+
+    #[test]
+    fn scalar_prepare_set_accepts_same_type() {
+        let root: Oid = "1.3.6.1.2.1.1.8".parse().unwrap();
+        let h = ScalarHandler::new(root.clone(), Value::Integer(1)).writable();
+        h.prepare_set(&root.child(0), &Value::Integer(2)).unwrap();
+        // Commit applies.
+        h.commit_set(&root.child(0), &Value::Integer(2)).unwrap();
+        assert_eq!(h.get(&root.child(0)), Some(Value::Integer(2)));
+    }
+
+    #[test]
+    fn map_prepare_set_rejects_unknown_instance() {
+        let root: Oid = "1.3.6.1.2.1.99.1".parse().unwrap();
+        let h = MapHandler::new(root.clone())
+            .with(root.child(1), Value::OctetString(b"lo".to_vec()))
+            .writable();
+        // Unknown index: plain maps do not support row creation.
+        let err = h
+            .prepare_set(&root.child(2), &Value::OctetString(b"x".to_vec()))
+            .unwrap_err();
+        assert_eq!(err, ErrorStatus::NoCreation);
+    }
+
+    #[test]
+    fn map_prepare_set_rejects_wrong_type() {
+        let root: Oid = "1.3.6.1.2.1.99.2".parse().unwrap();
+        let h = MapHandler::new(root.clone())
+            .with(root.child(1), Value::OctetString(b"lo".to_vec()))
+            .writable();
+        let err = h.prepare_set(&root.child(1), &Value::Integer(1)).unwrap_err();
+        assert_eq!(err, ErrorStatus::WrongType);
     }
 }

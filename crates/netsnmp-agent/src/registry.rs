@@ -61,17 +61,6 @@ impl Registry {
         VarBind::new(oid.clone(), Value::EndOfMibView)
     }
 
-    /// Resolve a single SET varbind, returning the SNMP error-status.
-    fn do_set(&self, oid: &Oid, value: &Value) -> ErrorStatus {
-        match self.handler_for(oid) {
-            Some(h) => match h.set(oid, value) {
-                Ok(()) => ErrorStatus::NoError,
-                Err(status) => status,
-            },
-            None => ErrorStatus::NotWritable,
-        }
-    }
-
     /// Process a request PDU and produce the response PDU, implementing the
     /// GET/GETNEXT/GETBULK/SET semantics of RFC 3416.
     pub fn process(&self, request: &Pdu) -> Pdu {
@@ -139,11 +128,45 @@ impl Registry {
         }
     }
 
-    /// SET: validate/apply each binding. On the first failure, report the
-    /// error-status and 1-based error-index, echoing the request varbinds.
+    /// SET: validate/apply each binding via the 4-phase transaction
+    /// (Reserve1 -> Reserve2 -> Commit, with Undo on commit failure).
+    ///
+    /// On any failure the response carries the SNMP error-status and the
+    /// 1-based error-index of the offending varbind, and echoes the request
+    /// varbinds (matching the legacy contract).
+    ///
+    /// The phases mirror Net-SNMP's "baby steps" and RFC 3416 §4.2.5:
+    ///
+    /// 1. **Reserve1**: every varbind is validated by
+    ///    [`MibHandler::prepare_set`](crate::handler::MibHandler::prepare_set).
+    ///    The first failure aborts the transaction immediately (nothing has
+    ///    been committed, so no Undo is needed).
+    /// 2. **Reserve2**: a second pass re-runs `prepare_set` so handlers may
+    ///    detect cross-varbind conflicts once every varbind has reserved. For
+    ///    the default handlers Reserve2 is a no-op.
+    /// 3. **Commit**: every varbind is committed by
+    ///    [`MibHandler::commit_set`](crate::handler::MibHandler::commit_set).
+    ///    Commits are attempted for *all* varbinds even if one fails (per RFC
+    ///    3416); the first failure is reported and Undo is best-effort invoked
+    ///    on the varbinds already committed.
     fn process_set(&self, request: &Pdu, response: &mut Pdu) {
-        for (idx, vb) in request.variables.iter().enumerate() {
-            let status = self.do_set(&vb.oid, &vb.value);
+        // Resolve each varbind's handler up front so we can re-use it across
+        // phases. A varbind with no handler is NotWritable (reserve failure).
+        let plans: Vec<(Option<&Arc<dyn MibHandler>>, &VarBind)> = request
+            .variables
+            .iter()
+            .map(|vb| (self.handler_for(&vb.oid), vb))
+            .collect();
+
+        // --- Reserve1: per-varbind validation. First failure aborts. ---
+        for (idx, (handler, vb)) in plans.iter().enumerate() {
+            let status = match handler {
+                Some(h) => match h.prepare_set(&vb.oid, &vb.value) {
+                    Ok(()) => ErrorStatus::NoError,
+                    Err(s) => s,
+                },
+                None => ErrorStatus::NotWritable,
+            };
             if !status.is_ok() {
                 response.error_status = status.code();
                 response.error_index = (idx + 1) as i64;
@@ -151,6 +174,77 @@ impl Registry {
                 return;
             }
         }
+
+        // --- Reserve2: second validation pass for cross-varbind checks. ---
+        // Handlers may detect conflicts once they know every varbind passed
+        // Reserve1; the default `prepare_set` is a no-op, so existing
+        // handlers incur no extra cost.
+        for (idx, (handler, vb)) in plans.iter().enumerate() {
+            let status = match handler {
+                Some(h) => match h.prepare_set(&vb.oid, &vb.value) {
+                    Ok(()) => ErrorStatus::NoError,
+                    Err(s) => s,
+                },
+                None => ErrorStatus::NotWritable,
+            };
+            if !status.is_ok() {
+                response.error_status = status.code();
+                response.error_index = (idx + 1) as i64;
+                response.variables = request.variables.clone();
+                return;
+            }
+        }
+
+        // --- Commit: apply side effects. Per RFC 3416, attempt every
+        // varbind even on failure, then best-effort undo the ones already
+        // committed. Report the first failure. ---
+        let mut commit_failed: Option<(usize, ErrorStatus)> = None;
+        let mut committed: Vec<usize> = Vec::with_capacity(plans.len());
+        for (idx, (handler, vb)) in plans.iter().enumerate() {
+            // A varbind with no handler should already have failed Reserve1.
+            let h = match handler {
+                Some(h) => *h,
+                None => {
+                    if commit_failed.is_none() {
+                        commit_failed = Some((idx, ErrorStatus::NotWritable));
+                    }
+                    continue;
+                }
+            };
+            match h.commit_set(&vb.oid, &vb.value) {
+                Ok(()) => committed.push(idx),
+                Err(s) => {
+                    if commit_failed.is_none() {
+                        commit_failed = Some((idx, s));
+                    }
+                }
+            }
+        }
+
+        if let Some((idx, status)) = commit_failed {
+            // Best-effort undo of the varbinds that were committed before the
+            // failure. Per RFC 3416 §4.2.5 the agent may report commitFailed
+            // (or undoFailed if undo itself breaks).
+            let mut undo_failed = false;
+            for &cidx in &committed {
+                let (_, vb) = plans[cidx];
+                if let Some(h) = self.handler_for(&vb.oid) {
+                    if h.undo_set(&vb.oid, &vb.value).is_err() {
+                        undo_failed = true;
+                    }
+                }
+            }
+            let reported = if undo_failed {
+                ErrorStatus::UndoFailed
+            } else {
+                status
+            };
+            response.error_status = reported.code();
+            response.error_index = (idx + 1) as i64;
+            response.variables = request.variables.clone();
+            return;
+        }
+
         // Success: echo back the new values.
         response.variables = request.variables.clone();
     }
@@ -159,7 +253,9 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handler::{MibHandler, Reading};
     use crate::scalar::{MapHandler, ScalarHandler};
+    use std::sync::Mutex;
 
     fn sample_registry() -> Registry {
         let mut reg = Registry::new();
@@ -254,5 +350,173 @@ mod tests {
         let resp = reg.process(&pdu);
         assert_eq!(resp.status(), ErrorStatus::NotWritable);
         assert_eq!(resp.error_index, 1);
+    }
+
+    /// A handler used to exercise the transactional SET phases. It records
+    /// every phase invocation into a shared log so the test can assert the
+    /// ordering (reserve1, reserve2, commit, undo) and that commits are not
+    /// applied when reserve fails.
+    struct PhaseSpy {
+        root: Oid,
+        log: Arc<Mutex<Vec<&'static str>>>,
+        reserve_ok: bool,
+        commit_ok: bool,
+        last_value: Mutex<Option<Value>>,
+    }
+
+    impl PhaseSpy {
+        fn new(root: Oid, log: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            PhaseSpy {
+                root,
+                log,
+                reserve_ok: true,
+                commit_ok: true,
+                last_value: Mutex::new(None),
+            }
+        }
+
+        fn with_reserve(mut self, ok: bool) -> Self {
+            self.reserve_ok = ok;
+            self
+        }
+
+        fn with_commit(mut self, ok: bool) -> Self {
+            self.commit_ok = ok;
+            self
+        }
+    }
+
+    impl MibHandler for PhaseSpy {
+        fn root(&self) -> &Oid {
+            &self.root
+        }
+        fn get(&self, _oid: &Oid) -> Option<Value> {
+            self.last_value.lock().unwrap().clone()
+        }
+        fn get_next(&self, oid: &Oid) -> Option<Reading> {
+            self.last_value
+                .lock()
+                .unwrap()
+                .clone()
+                .map(|v| Reading { oid: self.root.clone(), value: v })
+                .filter(|_| oid < &self.root)
+        }
+        fn prepare_set(&self, _oid: &Oid, _value: &Value) -> Result<(), ErrorStatus> {
+            self.log.lock().unwrap().push("prepare");
+            if self.reserve_ok {
+                Ok(())
+            } else {
+                Err(ErrorStatus::WrongValue)
+            }
+        }
+        fn commit_set(&self, _oid: &Oid, value: &Value) -> Result<(), ErrorStatus> {
+            self.log.lock().unwrap().push("commit");
+            if self.commit_ok {
+                *self.last_value.lock().unwrap() = Some(value.clone());
+                Ok(())
+            } else {
+                Err(ErrorStatus::CommitFailed)
+            }
+        }
+        fn undo_set(&self, _oid: &Oid, _value: &Value) -> Result<(), ErrorStatus> {
+            self.log.lock().unwrap().push("undo");
+            *self.last_value.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn set_transaction_runs_all_phases() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let root: Oid = "1.3.6.1.2.1.99.1".parse().unwrap();
+        let mut reg = Registry::new();
+        reg.register(Arc::new(PhaseSpy::new(root.clone(), Arc::clone(&log))));
+
+        let mut pdu = Pdu::new(PduType::Set, 1);
+        pdu.variables.push(VarBind::new(
+            root.clone(),
+            Value::Integer(7),
+        ));
+        let resp = reg.process(&pdu);
+        assert_eq!(resp.status(), ErrorStatus::NoError);
+        // prepare is called twice (Reserve1 + Reserve2), commit once.
+        assert_eq!(*log.lock().unwrap(), vec!["prepare", "prepare", "commit"]);
+        assert_eq!(reg.handlers[0].get(&root), Some(Value::Integer(7)));
+    }
+
+    #[test]
+    fn set_reserve_failure_skips_commit_and_undo() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let root: Oid = "1.3.6.1.2.1.99.2".parse().unwrap();
+        let mut reg = Registry::new();
+        reg.register(Arc::new(
+            PhaseSpy::new(root.clone(), Arc::clone(&log)).with_reserve(false),
+        ));
+
+        let mut pdu = Pdu::new(PduType::Set, 1);
+        pdu.variables.push(VarBind::new(root.clone(), Value::Integer(7)));
+        let resp = reg.process(&pdu);
+        assert_eq!(resp.status(), ErrorStatus::WrongValue);
+        assert_eq!(resp.error_index, 1);
+        // Reserve1 fails immediately: no second prepare, no commit, no undo.
+        assert_eq!(*log.lock().unwrap(), vec!["prepare"]);
+        assert_eq!(reg.handlers[0].get(&root), None);
+    }
+
+    #[test]
+    fn set_multi_varbind_atomicity() {
+        // Two writable scalars. The second rejects in Reserve; the first
+        // must NOT have been committed.
+        let mut reg = Registry::new();
+        let a: Oid = "1.3.6.1.2.1.99.10".parse().unwrap();
+        let b: Oid = "1.3.6.1.2.1.99.20".parse().unwrap();
+        reg.register(Arc::new(
+            ScalarHandler::new(a.clone(), Value::OctetString(b"old-a".to_vec())).writable(),
+        ));
+        reg.register(Arc::new(
+            ScalarHandler::new(b.clone(), Value::OctetString(b"old-b".to_vec())).writable(),
+        ));
+
+        let mut pdu = Pdu::new(PduType::Set, 1);
+        pdu.variables.push(VarBind::new(
+            a.child(0),
+            Value::OctetString(b"new-a".to_vec()),
+        ));
+        // Wrong type for B (Integer onto OctetString scalar): reserve fails.
+        pdu.variables
+            .push(VarBind::new(b.child(0), Value::Integer(99)));
+        let resp = reg.process(&pdu);
+        assert_eq!(resp.status(), ErrorStatus::WrongType);
+        assert_eq!(resp.error_index, 2);
+
+        // A retains its old value: no commit happened.
+        let get_a = Pdu::new(PduType::Get, 2).with_null_var(a.child(0));
+        let resp_a = reg.process(&get_a);
+        assert_eq!(
+            resp_a.variables[0].value,
+            Value::OctetString(b"old-a".to_vec())
+        );
+    }
+
+    #[test]
+    fn set_commit_failure_triggers_undo() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let ok_root: Oid = "1.3.6.1.2.1.99.30".parse().unwrap();
+        let bad_root: Oid = "1.3.6.1.2.1.99.40".parse().unwrap();
+        let mut reg = Registry::new();
+        reg.register(Arc::new(PhaseSpy::new(ok_root.clone(), Arc::clone(&log))));
+        reg.register(Arc::new(
+            PhaseSpy::new(bad_root.clone(), Arc::clone(&log)).with_commit(false),
+        ));
+
+        let mut pdu = Pdu::new(PduType::Set, 1);
+        pdu.variables.push(VarBind::new(ok_root.clone(), Value::Integer(1)));
+        pdu.variables.push(VarBind::new(bad_root.clone(), Value::Integer(2)));
+        let resp = reg.process(&pdu);
+        assert_eq!(resp.status(), ErrorStatus::CommitFailed);
+        assert_eq!(resp.error_index, 2);
+        // The first handler committed, then was undone because the second failed.
+        let l = log.lock().unwrap();
+        assert!(l.contains(&"undo"), "expected undo to be invoked, got {l:?}");
     }
 }

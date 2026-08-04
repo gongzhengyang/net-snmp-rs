@@ -40,6 +40,7 @@ pub fn bin(name: &str) -> &'static str {
         "snmpvacm" => env!("CARGO_BIN_EXE_snmpvacm"),
         "encode_keychange" => env!("CARGO_BIN_EXE_encode_keychange"),
         "snmpconf" => env!("CARGO_BIN_EXE_snmpconf"),
+        "agentxtrap" => env!("CARGO_BIN_EXE_agentxtrap"),
         other => panic!("unknown test binary: {other}"),
     }
 }

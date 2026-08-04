@@ -31,23 +31,32 @@
 //! snmp/setSerialNo) modules.
 
 pub mod at;
+pub mod bridge;
 pub mod collector;
+pub mod etherlike;
 pub mod extend;
 pub mod host;
 pub mod icmp;
 pub mod interfaces;
 pub mod ip;
 pub mod lm_sensors;
+pub mod mta;
+pub mod netsnmp_agent;
+pub mod netsnmp_system;
 pub mod notify;
 pub mod pass;
+pub mod rmon;
 pub mod route;
+pub mod sctp;
 pub mod set_serial;
 pub mod snmp_framework;
 pub mod snmp_mib;
 pub mod snmp_mpd;
+pub mod smux_mib;
 pub mod system;
 pub mod sysor;
 pub mod tcp;
+pub mod tunnel;
 pub mod ucd;
 pub mod udp;
 pub mod usm_stats;
@@ -55,6 +64,11 @@ pub mod vacm;
 
 // Convenience re-exports so callers can write `mibgroup::SysOrTable` etc.
 pub use extend::extend_handler;
+pub use netsnmp_agent::{
+    NsCacheState, NsModuleSnapshot, netsnmp_agent_handlers, ns_cache_handlers, ns_debug_handlers,
+    ns_logging_handlers, ns_module_handlers, ns_transaction_handlers, ns_vacm_access_handlers,
+};
+pub use netsnmp_system::netsnmp_system_handlers;
 pub use notify::{notify_handlers, register_notify_mibs};
 pub use pass::PassHandler;
 pub use snmp_framework::{EngineSnapshot, EngineSnapshotProvider};
@@ -318,4 +332,76 @@ pub fn register_mib2_mibs(registry: &mut Registry, snmp_counters: Option<Arc<Snm
         registry.register(handler);
     }
     registry.register(set_serial::set_serial_no_handler());
+}
+
+/// Register the NET-SNMP self-management MIB modules into `registry`:
+///
+/// * NET-SNMP-AGENT-MIB (`1.3.6.1.4.1.8072.1`): the `nsCache`, `nsDebug`,
+///   `nsLogging`, `nsModuleTable`, `nsTransactionTable` and `nsVacmAccessTable`
+///   objects served by [`netsnmp_agent::netsnmp_agent_handlers`].
+/// * NET-SNMP-MIB version-info scalars (`nsVersionString.0`) served by
+///   [`netsnmp_system::netsnmp_system_handlers`].
+///
+/// `cache_state` backs the `nsCache` group; when `None` a fresh
+/// [`NsCacheState`] (caching enabled, no per-module TTLs) is created.
+/// `modules`, when supplied, is the snapshot of registered handlers that
+/// `nsModuleTable` reflects; when `None` the table is served empty.
+///
+/// This is an **append-only** addition: it does not touch any subtree installed
+/// by [`register_system_mibs`], [`register_framework_mibs`] or
+/// [`register_mib2_mibs`].
+pub fn register_netsnmp_mibs(
+    registry: &mut Registry,
+    cache_state: Option<Arc<NsCacheState>>,
+    modules: Option<Arc<NsModuleSnapshot>>,
+) {
+    let cache_state = cache_state.unwrap_or_else(NsCacheState::new);
+    for handler in netsnmp_agent::netsnmp_agent_handlers(cache_state, modules) {
+        registry.register(handler);
+    }
+    for handler in netsnmp_system::netsnmp_system_handlers() {
+        registry.register(handler);
+    }
+}
+
+/// Register the protocol "miscellaneous" MIB modules into `registry`: the
+/// EtherLike-MIB, BRIDGE-MIB, SCTP-MIB, TUNNEL-MIB, RMON-MIB and MTA-MIB
+/// (Task 5.26). These are breadth-completion modules that return structurally
+/// correct but mostly empty/zero tables on hosts without the corresponding
+/// kernel or daemon support.
+///
+/// This is an **append-only** addition: it does not touch any subtree installed
+/// by [`register_system_mibs`], [`register_framework_mibs`],
+/// [`register_mib2_mibs`] or [`register_netsnmp_mibs`].
+pub fn register_protocol_misc_mibs(registry: &mut Registry) {
+    for handler in etherlike::etherlike_handlers() {
+        registry.register(handler);
+    }
+    for handler in bridge::bridge_handlers() {
+        registry.register(handler);
+    }
+    for handler in sctp::sctp_handlers() {
+        registry.register(handler);
+    }
+    for handler in tunnel::tunnel_handlers() {
+        registry.register(handler);
+    }
+    for handler in rmon::rmon_handlers() {
+        registry.register(handler);
+    }
+    for handler in mta::mta_handlers() {
+        registry.register(handler);
+    }
+}
+
+/// Register the SMUX-MIB (`1.3.6.1.2.1.20`, RFC 1227 §4) into `registry`,
+/// backed by the live SMUX server `server`. The MIB reflects the peers
+/// currently connected and the subtrees each owns.
+///
+/// This is an **append-only** addition; it does not touch any subtree installed
+/// by the other `register_*` helpers.
+pub fn register_smux_mibs(registry: &mut Registry, server: Arc<crate::smux::SmuxServer>) {
+    for handler in smux_mib::smux_mib_handlers(server) {
+        registry.register(handler);
+    }
 }

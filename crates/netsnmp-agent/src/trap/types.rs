@@ -1,7 +1,11 @@
 //! Configuration and result types for the trap receiver.
 
+use std::sync::Arc;
+
 use netsnmp::trap::Notification;
 use netsnmp::usm::UsmUser;
+
+use super::sink::TrapSink;
 
 /// The SNMP message version a notification arrived on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +29,19 @@ pub struct TrapReceiverConfig {
     pub engine_boots: u32,
     /// Configured SNMPv3/USM users (empty disables v3).
     pub users: Vec<UsmUser>,
+    /// Optional `snmptrapd`-style `-F FORMAT` string. When set, each received
+    /// notification is rendered via
+    /// [`format_notification`](super::format::format_notification) before being
+    /// handed to [`sinks`](Self::sinks); otherwise the default human-readable
+    /// form is used.
+    pub format: Option<String>,
+    /// Output backends (file, traphandle, forward, ...). When non-empty, each
+    /// received notification is passed to every sink; the legacy
+    /// [`TrapReceiver::serve_on`](super::TrapReceiver::serve_on) callback is
+    /// then *not* required (but is still invoked if supplied, for backwards
+    /// compatibility). When empty (the default), behaviour is unchanged: the
+    /// caller's callback is the sole output path.
+    pub sinks: Vec<Arc<dyn TrapSink>>,
 }
 
 impl Default for TrapReceiverConfig {
@@ -35,6 +52,8 @@ impl Default for TrapReceiverConfig {
             engine_id: vec![0x80, 0x00, 0x1f, 0x88, 0x04, b'r', b's', b't', 0x01],
             engine_boots: 1,
             users: Vec::new(),
+            format: None,
+            sinks: Vec::new(),
         }
     }
 }

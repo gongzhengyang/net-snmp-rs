@@ -4,6 +4,10 @@
 //! * `snmptrapd` (receiver) is launched as a child process and fed a trap from
 //!   an in-process [`Session`].
 
+// Test names mirror upstream tool/flag names (e.g. `snmptrapd_format_F_...`),
+// which are not snake_case; allow that here rather than mangle the names.
+#![allow(non_snake_case)]
+
 mod common;
 
 use std::process::{Command, Stdio};
@@ -249,6 +253,137 @@ async fn snmptrapd_receives_and_prints_trap() {
     let _ = child.wait();
 
     assert!(saw_trap, "snmptrapd did not print the received trap");
+}
+
+/// Run the real `snmptrapd` with `-F FORMAT` and confirm the formatted output
+/// appears. Sends a coldStart trap and asserts the output contains the trap OID
+/// (numeric, via `%q`) and the varbind list (via `%v`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snmptrapd_format_F_outputs_custom_format() {
+    let addr = reserve_udp_addr();
+
+    let mut child = Command::new(bin("snmptrapd"))
+        .args(["-c", "public", "-F", "%q %v", &addr])
+        .env("RUST_LOG", "info")
+        .env("MIBDIRS", "")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn snmptrapd");
+
+    let mut lines = line_stream(&mut child);
+    assert!(
+        wait_for(&mut lines, "listening", Duration::from_secs(5)).await,
+        "snmptrapd did not report listening"
+    );
+
+    let session = Session::open_udp(
+        &addr,
+        SessionConfig {
+            version: Version::V2c,
+            community: b"public".to_vec(),
+            timeout: Duration::from_secs(2),
+            retries: 1,
+        },
+    )
+    .await
+    .expect("open session");
+    let trap_oid: Oid = COLD_START.parse().unwrap();
+    let extra = vec![netsnmp::pdu::VarBind::new(
+        "1.3.6.1.2.1.1.5.0".parse().unwrap(),
+        netsnmp::value::Value::OctetString(b"format-host".to_vec()),
+    )];
+    session.send_trap(789, &trap_oid, extra).await.unwrap();
+
+    // The formatted line is "<trap-oid-numeric> <varbinds>". With an empty MIB
+    // the trap OID renders numerically (`.1.3.6.1.6.3.1.1.5.1`) and the varbind
+    // as `name = value`.
+    let saw = wait_for(&mut lines, "1.3.6.1.6.3.1.1.5.1", Duration::from_secs(5)).await;
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(saw, "snmptrapd -F did not print the formatted trap OID");
+}
+
+/// Run the real `snmptrapd` with `--traphandle OID SCRIPT` and confirm the
+/// script is invoked when a matching trap arrives. The script writes a marker
+/// file whose contents are the varbinds it received on stdin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snmptrapd_traphandle_invokes_script() {
+    let addr = reserve_udp_addr();
+    let marker = std::env::temp_dir().join(format!(
+        "netsnmp-rs-traphandle-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let marker_str = marker.to_string_lossy().to_string();
+    // The script reads stdin, writes it to the marker file, then exits.
+    let script = format!("cat > {marker_str}");
+
+    let mut child = Command::new(bin("snmptrapd"))
+        .args([
+            "-c",
+            "public",
+            "--traphandle",
+            COLD_START,
+            &script,
+            &addr,
+        ])
+        .env("RUST_LOG", "info")
+        .env("MIBDIRS", "")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn snmptrapd");
+
+    let mut lines = line_stream(&mut child);
+    assert!(
+        wait_for(&mut lines, "listening", Duration::from_secs(5)).await,
+        "snmptrapd did not report listening"
+    );
+
+    let session = Session::open_udp(
+        &addr,
+        SessionConfig {
+            version: Version::V2c,
+            community: b"public".to_vec(),
+            timeout: Duration::from_secs(2),
+            retries: 1,
+        },
+    )
+    .await
+    .expect("open session");
+    let trap_oid: Oid = COLD_START.parse().unwrap();
+    let extra = vec![netsnmp::pdu::VarBind::new(
+        "1.3.6.1.2.1.1.5.0".parse().unwrap(),
+        netsnmp::value::Value::OctetString(b"handle-host".to_vec()),
+    )];
+    session.send_trap(42, &trap_oid, extra).await.unwrap();
+
+    // Poll for the marker file (the traphandle runs asynchronously).
+    let mut saw = false;
+    for _ in 0..100 {
+        if let Ok(content) = std::fs::read_to_string(&marker) {
+            // The script receives the varbinds on stdin as `name = value`.
+            if content.contains("handle-host") {
+                saw = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&marker);
+
+    assert!(
+        saw,
+        "traphandle script was not invoked or did not receive the varbinds"
+    );
 }
 
 /// Merge a child's stdout and stderr into a single stream of text lines.

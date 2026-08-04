@@ -30,7 +30,11 @@ pub use cli::{CommonArgs, CommonOpts};
 pub use client::{Client, connect, connect_notifier};
 pub use error::{AppError, ArgError};
 pub use mib::{load_mib_registry, split_dir_list};
-pub use settings::{ClientDefaults, SnmpdSettings, load_client_defaults, load_snmpd_settings};
+pub use settings::{
+    AccessEntry, ClientDefaults, Com2Sec, DiskEntry, ExecEntry, FileEntry, GroupEntry, LoadEntry,
+    LogMatchEntry, MasterConfig, PassEntry, ProcEntry, ProxyEntry, SmuxPeerEntry, SnmpdSettings,
+    TrapSession, TrapSink, TrapSinkKind, ViewEntry, load_client_defaults, load_snmpd_settings,
+};
 pub use usm::{parse_auth_proto, parse_priv_proto};
 pub use value::{parse_hex_string, parse_typed_value};
 
@@ -188,7 +192,7 @@ createUser bob SHA authpass AES privpass
         assert_eq!(s.community.as_deref(), Some("public"));
         assert_eq!(s.sys_location.as_deref(), Some("Server Room 1"));
         assert_eq!(s.sys_contact.as_deref(), Some("admin@example.org"));
-        assert_eq!(s.agent_address.as_deref(), Some("0.0.0.0:10161"));
+        assert_eq!(s.agent_address.first().map(String::as_str), Some("0.0.0.0:10161"));
         assert_eq!(s.users.len(), 1);
         assert_eq!(s.users[0].name, "bob");
         assert_eq!(

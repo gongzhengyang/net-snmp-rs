@@ -163,6 +163,27 @@ impl ScalarHandler {
         self.writable = true;
         self
     }
+
+    /// The root OID this scalar is registered under (without the trailing `.0`
+    /// instance sub-identifier).
+    pub fn root(&self) -> &Oid {
+        &self.root
+    }
+
+    /// A snapshot of the scalar's current value. Used by the persistence layer
+    /// ([`crate::persist::ScalarPersistable`]) to serialize writable scalars
+    /// across agent restarts.
+    pub fn get_value(&self) -> Value {
+        self.value.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Replace the scalar's current value. Used by the persistence layer to
+    /// restore a saved value at agent startup; also handy for out-of-band
+    /// updates that bypass the SET/commit machinery. The new value's SMI base
+    /// type need not match the previous one.
+    pub fn set_value(&self, value: Value) {
+        *self.value.write().unwrap_or_else(|e| e.into_inner()) = value;
+    }
 }
 
 impl MibHandler for ScalarHandler {

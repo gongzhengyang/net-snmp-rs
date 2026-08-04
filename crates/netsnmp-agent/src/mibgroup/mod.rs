@@ -21,6 +21,7 @@
 pub mod collector;
 pub mod host;
 pub mod interfaces;
+pub mod notify;
 pub mod snmp_framework;
 pub mod snmp_mpd;
 pub mod system;
@@ -30,6 +31,7 @@ pub mod usm_stats;
 pub mod vacm;
 
 // Convenience re-exports so callers can write `mibgroup::SysOrTable` etc.
+pub use notify::{notify_handlers, register_notify_mibs};
 pub use snmp_framework::{EngineSnapshot, EngineSnapshotProvider};
 pub use snmp_mpd::SnmpMpdStats;
 pub use sysor::SysOrTable;
@@ -69,9 +71,40 @@ impl Default for SystemMibConfig {
 /// underlying system is sampled at most once per refresh interval, even during
 /// a full walk.
 pub fn register_system_mibs(registry: &mut Registry, config: &SystemMibConfig) {
+    register_system_mibs_inner(registry, config, false).1;
+}
+
+/// Like [`register_system_mibs`] but also returns the writable system scalar
+/// handlers (`sysContact`, `sysName`, `sysLocation`) so callers (e.g. `snmpd`)
+/// can attach them to a [`Persistence`](crate::Persistence) layer. Returns
+/// `(handlers_already_registered, writable_scalars)`.
+pub fn register_system_mibs_with_persistables(
+    registry: &mut Registry,
+    config: &SystemMibConfig,
+) -> Vec<Arc<crate::scalar::ScalarHandler>> {
+    register_system_mibs_inner(registry, config, true).0
+}
+
+fn register_system_mibs_inner(
+    registry: &mut Registry,
+    config: &SystemMibConfig,
+    return_writable: bool,
+) -> (Vec<Arc<crate::scalar::ScalarHandler>>, ()) {
     let collector = collector::HostCollector::new();
 
-    for handler in system::system_handlers(&config.contact, &config.location, config.start) {
+    let (system_handlers, writable) = if return_writable {
+        system::system_handlers_with_persistables(
+            &config.contact,
+            &config.location,
+            config.start,
+        )
+    } else {
+        (
+            system::system_handlers(&config.contact, &config.location, config.start),
+            Vec::new(),
+        )
+    };
+    for handler in system_handlers {
         registry.register(handler);
     }
 
@@ -87,6 +120,7 @@ pub fn register_system_mibs(registry: &mut Registry, config: &SystemMibConfig) {
 
     // UCD-SNMP-MIB: load averages, memory, per-filesystem usage, CPU summary.
     registry.register(ucd::ucd_handler(collector));
+    (writable, ())
 }
 
 /// Configuration for the SNMP framework/engine MIB modules.

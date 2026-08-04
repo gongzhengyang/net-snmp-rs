@@ -198,7 +198,7 @@ createUser carol MD5 carolpass
     assert_eq!(settings.community.as_deref(), Some("readwrite"));
     assert_eq!(settings.sys_location.as_deref(), Some("Server Room 1"));
     assert_eq!(settings.sys_contact.as_deref(), Some("ops@example.org"));
-    assert_eq!(settings.agent_address.as_deref(), Some("0.0.0.0:1610"));
+    assert_eq!(settings.agent_address.first().map(String::as_str), Some("0.0.0.0:1610"));
     assert_eq!(settings.users.len(), 1);
     assert_eq!(settings.users[0].name, "carol");
     assert_eq!(
@@ -213,4 +213,193 @@ fn createuser_without_passphrase_errors() {
     let conf = "createUser dave MD5\n";
     let err = SnmpdSettings::from_directives(&netsnmp::config::parse_str(conf));
     assert!(err.is_err());
+}
+
+#[test]
+fn full_snmpd_conf_directives_parsed() {
+    let conf = r#"
+# VACM
+com2sec readonly default public
+com2sec6 readonly6 default public
+group mygroup v2c public
+view all included .1.3.6.1.2.1
+view system included .1.3.6.1.2.1.1
+access mygroup "" any noauth prefix all NULL all
+
+# community + system
+rocommunity rocomm
+rwcommunity rwcomm
+syslocation "Server Room 1"
+syscontact ops@example.org
+agentAddress udp:1610,tcp:1162
+agentAddress udp:1163
+
+# notifications
+trapsink trap.example.com public 162
+trap2sink trap2.example.com
+informsink inform.example.com
+trapsess -v 2c -c public sess.example.com
+
+# proxy
+proxy -Cn ctx proxied 10.0.0.1 .1.3.6.1.4.1.8072
+
+# exec/extend/pass/disk/proc/load/file/logmatch
+exec check_load /usr/local/bin/check_load
+extend .1.3.6.1.4.1.8072.999 myname /bin/echo hello
+pass .1.3.6.1.4.1.8072.1 /usr/local/bin/passscript
+pass_persist .1.3.6.1.4.1.8072.2 /usr/local/bin/persistscript
+disk / 10%
+disk /var
+proc sendmail 10 1
+load 12 10 5
+file /var/log/messages 1000000
+logmatch mymatch /var/log/syslog "error"
+
+# master / smux / iquery / persistentDir
+master agentx
+agentXSocket /tmp/agentx
+smuxpeer .1.3.6.1.4.1.8072 secret
+smuxsocket 161
+iquery internaluser
+persistentDir /var/lib/snmp
+
+createUser carol SHA carolpass AES privpass
+"#;
+    let settings =
+        SnmpdSettings::from_directives(&netsnmp::config::parse_str(conf)).expect("parse");
+
+    // Community: rwcommunity wins over rocommunity.
+    assert_eq!(settings.community.as_deref(), Some("rwcomm"));
+    assert_eq!(settings.sys_location.as_deref(), Some("Server Room 1"));
+    assert_eq!(settings.sys_contact.as_deref(), Some("ops@example.org"));
+
+    // agentAddress: comma- and space-separated lists expanded across directives.
+    assert_eq!(settings.agent_address.len(), 3);
+    assert_eq!(settings.agent_address[0], "0.0.0.0:1610");
+    assert_eq!(settings.agent_address[1], "0.0.0.0:1162");
+    assert_eq!(settings.agent_address[2], "0.0.0.0:1163");
+
+    // VACM entries.
+    assert_eq!(settings.com2sec.len(), 2);
+    assert_eq!(settings.com2sec[0].name, "readonly");
+    assert_eq!(settings.com2sec[0].community, "public");
+    assert_eq!(settings.groups.len(), 1);
+    assert_eq!(settings.groups[0].name, "mygroup");
+    assert_eq!(settings.views.len(), 2);
+    assert_eq!(settings.views[0].name, "all");
+    assert_eq!(settings.access.len(), 1);
+    assert_eq!(settings.access[0].name, "mygroup");
+    assert_eq!(settings.access[0].read_view, "all");
+    // A Vacm was built from the directives.
+    assert!(settings.has_vacm());
+    assert!(settings.vacm.is_some());
+
+    // Trap sinks.
+    assert_eq!(settings.trapsinks.len(), 3);
+    assert_eq!(settings.trapsinks[0].host, "trap.example.com");
+    assert_eq!(settings.trapsinks[0].community, "public");
+    assert_eq!(settings.trapsinks[0].port, Some(162));
+    assert_eq!(settings.trapsinks[2].host, "inform.example.com");
+    assert_eq!(settings.trapsesses.len(), 1);
+    assert_eq!(settings.trapsesses[0].host, "sess.example.com");
+
+    // Proxy.
+    assert_eq!(settings.proxy.len(), 1);
+    assert_eq!(settings.proxy[0].context.as_deref(), Some("ctx"));
+    assert_eq!(settings.proxy[0].community, "proxied");
+    assert_eq!(settings.proxy[0].host, "10.0.0.1");
+
+    // exec/extend/pass/disk/proc/load/file/logmatch.
+    assert_eq!(settings.exec.len(), 2);
+    assert_eq!(settings.exec[0].name, "check_load");
+    assert_eq!(settings.exec[0].program, "/usr/local/bin/check_load");
+    assert_eq!(settings.exec[1].mib_oid.as_deref(), Some(".1.3.6.1.4.1.8072.999"));
+    assert_eq!(settings.exec[1].name, "myname");
+    assert_eq!(settings.pass.len(), 2);
+    assert!(!settings.pass[0].persist);
+    assert!(settings.pass[1].persist);
+    assert_eq!(settings.disk.len(), 2);
+    assert_eq!(settings.disk[0].min.as_deref(), Some("10%"));
+    assert_eq!(settings.disk[1].min, None);
+    assert_eq!(settings.proc.len(), 1);
+    assert_eq!(settings.proc[0].max.as_deref(), Some("10"));
+    assert_eq!(settings.proc[0].min.as_deref(), Some("1"));
+    assert!(settings.load.is_some());
+    assert_eq!(settings.load.as_ref().unwrap().one.as_deref(), Some("12"));
+    assert_eq!(settings.file.len(), 1);
+    assert_eq!(settings.logmatch.len(), 1);
+    assert_eq!(settings.logmatch[0].file, "/var/log/syslog");
+
+    // master / smux / iquery / persistentDir.
+    assert!(settings.master.is_some());
+    assert_eq!(settings.master.as_ref().unwrap().typ, "agentx");
+    assert_eq!(
+        settings.master.as_ref().unwrap().socket.as_deref(),
+        Some("/tmp/agentx")
+    );
+    assert_eq!(settings.smuxpeer.len(), 1);
+    assert_eq!(settings.smuxsocket.as_deref(), Some("161"));
+    assert_eq!(settings.iquery.as_deref(), Some("internaluser"));
+    assert_eq!(
+        settings.persistent_dir.as_deref(),
+        Some(std::path::Path::new("/var/lib/snmp"))
+    );
+
+    // createUser still flows through.
+    assert_eq!(settings.users.len(), 1);
+    assert_eq!(settings.users[0].name, "carol");
+}
+
+#[test]
+fn vacm_directives_build_a_vacm() {
+    use netsnmp_agent::{AccessView, Vacm};
+    let conf = "\
+com2sec sec default public
+group g v2c public
+view all included .1.3.6.1.2.1
+access g \"\" any noauth prefix all NULL all
+";
+    let dirs = netsnmp::config::parse_str(conf);
+    let settings = SnmpdSettings::from_directives(&dirs).expect("parse");
+    let vacm = settings.vacm.expect("vacm built");
+    // `public` can read the system group; an unknown community cannot.
+    assert!(vacm.is_view_accessible(
+        AccessView::Read,
+        2,
+        &b"public".to_vec(),
+        0,
+        &Vec::new(),
+        &"1.3.6.1.2.1.1.1.0".parse().unwrap(),
+    ));
+    assert!(!vacm.is_view_accessible(
+        AccessView::Read,
+        2,
+        &b"other".to_vec(),
+        0,
+        &Vec::new(),
+        &"1.3.6.1.2.1.1.1.0".parse().unwrap(),
+    ));
+    // No write view (NULL) -> SET denied.
+    assert!(!vacm.is_view_accessible(
+        AccessView::Write,
+        2,
+        &b"public".to_vec(),
+        0,
+        &Vec::new(),
+        &"1.3.6.1.2.1.1.1.0".parse().unwrap(),
+    ));
+    // The Vacm is reusable: feeding the same directives reproduces the state.
+    let _again = Vacm::from_config_directives(&dirs);
+}
+
+#[test]
+fn docker_snmpd_conf_parses_without_error() {
+    // The shipped example snmpd.conf must parse cleanly.
+    let conf = std::include_str!("../../../docker/etc-snmp/snmpd.conf");
+    let settings =
+        SnmpdSettings::from_directives(&netsnmp::config::parse_str(conf)).expect("parse example");
+    assert_eq!(settings.community.as_deref(), Some("public"));
+    assert_eq!(settings.agent_address.len(), 1);
+    assert_eq!(settings.users.len(), 1);
+    assert_eq!(settings.users[0].name, "bob");
 }

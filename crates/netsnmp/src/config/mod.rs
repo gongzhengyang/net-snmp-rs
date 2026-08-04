@@ -25,7 +25,7 @@
 
 mod parse;
 mod search;
-mod word;
+pub mod word;
 
 use std::path::PathBuf;
 

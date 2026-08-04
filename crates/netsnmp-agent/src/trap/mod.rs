@@ -16,20 +16,27 @@
 //! [`handle_datagram`](TrapReceiver::handle_datagram) dispatches between them.
 
 mod community;
+pub mod format;
+mod notiflog;
 mod secure;
+pub mod sink;
 mod types;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use netsnmp::error::{Error, Result};
+use netsnmp::mib::MibRegistry;
 use netsnmp::pdu::{Pdu, PduType};
 use netsnmp::usm::UsmUser;
 use netsnmp::v3::{self, EngineParams};
 use tokio::net::UdpSocket;
 use tracing::{debug, trace};
 
+pub use notiflog::{NotificationLog, notiflog_handler, register_notiflog_mibs};
+pub use sink::{FileSink, ForwardSink, HandleRule, HandleSink, StdoutSink, TrapSink};
 pub use types::{NotifyVersion, ReceivedNotification, TrapDisposition, TrapReceiverConfig};
 
 /// A UDP notification receiver: the core of `snmptrapd`.
@@ -38,6 +45,12 @@ pub struct TrapReceiver {
     users: HashMap<Vec<u8>, UsmUser>,
     boot_time: Instant,
     usm_stats: AtomicU32,
+    /// Optional MIB registry used to render symbolic names when sinks are
+    /// configured (the `-F` format path). `None` falls back to numeric OIDs.
+    mib: Option<Arc<MibRegistry>>,
+    /// Optional NOTIFICATION-LOG-MIB ring buffer; when set, each received
+    /// notification is recorded for walkable history.
+    notiflog: Option<Arc<NotificationLog>>,
 }
 
 impl TrapReceiver {
@@ -53,7 +66,25 @@ impl TrapReceiver {
             users,
             boot_time: Instant::now(),
             usm_stats: AtomicU32::new(0),
+            mib: None,
+            notiflog: None,
         }
+    }
+
+    /// Attach a [`MibRegistry`] for symbolic OID rendering when sinks/format
+    /// are configured (builder style). When `None`, sink output uses numeric
+    /// OIDs.
+    pub fn with_mib(mut self, mib: Arc<MibRegistry>) -> Self {
+        self.mib = Some(mib);
+        self
+    }
+
+    /// Attach a [`NotificationLog`] ring buffer: each received notification is
+    /// appended to it (for the walkable `nlmLogTable`). The same [`Arc`] should
+    /// be registered via [`register_notiflog_mibs`] so walkers see the entries.
+    pub fn with_notiflog(mut self, log: Arc<NotificationLog>) -> Self {
+        self.notiflog = Some(log);
+        self
     }
 
     /// The current authoritative engine parameters.
@@ -94,10 +125,19 @@ impl TrapReceiver {
     /// Serve on an already-bound socket, invoking `on_notification` for each
     /// valid trap/inform and replying to the peer when an acknowledgement is
     /// required. This never returns under normal operation.
+    ///
+    /// When [`TrapReceiverConfig::sinks`] are configured they are also invoked
+    /// for each notification (the formatted line is rendered via the
+    /// [`format`](TrapReceiverConfig::format) string or the default form). The
+    /// `on_notification` callback is always invoked as well, preserving
+    /// backwards compatibility: existing callers that print via the callback
+    /// keep working unchanged.
     pub async fn serve_on<F>(&self, socket: UdpSocket, mut on_notification: F) -> Result<()>
     where
         F: FnMut(&ReceivedNotification, std::net::SocketAddr),
     {
+        let empty_mib = MibRegistry::new();
+        let mib = self.mib.as_deref().unwrap_or(&empty_mib);
         let mut buf = vec![0u8; 65535];
         loop {
             let (n, peer) = socket.recv_from(&mut buf).await?;
@@ -111,6 +151,30 @@ impl TrapReceiver {
                 }
             };
             if let Some(note) = &disposition.notification {
+                // NOTIFICATION-LOG-MIB ring buffer — record before sinks so the
+                // entry is visible to a walker even if a sink errors.
+                if let Some(log) = &self.notiflog {
+                    let engine_id = note
+                        .security_name
+                        .as_deref()
+                        .map(str::as_bytes)
+                        .unwrap_or_default()
+                        .to_vec();
+                    log.record(
+                        note.notification.trap_oid.clone(),
+                        engine_id,
+                        peer.to_string(),
+                    );
+                }
+                // Sinks (file/traphandle/forward) — only when configured.
+                if !self.config.sinks.is_empty() {
+                    let line = sink::render_line(self.config.format.as_deref(), note, mib, peer);
+                    for s in &self.config.sinks {
+                        if let Err(e) = s.log(&line, note, peer) {
+                            debug!(error = %e, "trap sink reported an error, continuing");
+                        }
+                    }
+                }
                 on_notification(note, peer);
             }
             if let Some(reply) = disposition.reply {

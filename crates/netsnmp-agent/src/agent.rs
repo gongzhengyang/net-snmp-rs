@@ -5,6 +5,8 @@
 //! and send back responses. Community authentication is checked here, mirroring
 //! the simple community ACL behaviour of the C agent's `snmpd.conf` rocommunity.
 
+use crate::notify::NotificationOriginator;
+use crate::persist::Persistence;
 use crate::registry::{Registry, SecurityContext};
 use crate::vacm::Vacm;
 use netsnmp::error::{Error, Result};
@@ -12,6 +14,8 @@ use netsnmp::message::{Message, Version};
 use netsnmp::usm::UsmUser;
 use netsnmp::v3::{self, EngineParams, HeaderData, UsmSecurityParameters, UsmStat};
 use std::collections::HashMap;
+use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
@@ -41,6 +45,26 @@ pub struct AgentConfig {
     /// authentication alone gates access, exactly as before). Supply a
     /// populated `Vacm` to enforce per-view read/write/notify ACLs.
     pub vacm: Option<Arc<Vacm>>,
+    /// Optional persistence layer. When set, [`Agent::save_persistent`] writes
+    /// every registered [`Persistable`](crate::Persistable) item (writable
+    /// system scalars, `snmpEngineBoots`, …) to the persistent directory so
+    /// they survive restarts. The agent does **not** auto-flush periodically;
+    /// the caller (e.g. `snmpd` on `SIGTERM`/`SIGINT`) must invoke
+    /// [`Agent::save_persistent`] before exiting.
+    pub persistence: Option<Arc<Persistence>>,
+    /// Optional override of the persistent directory (from a `persistentDir`
+    /// directive or `--persistent-dir` flag). When `None`, the agent uses
+    /// [`default_persistent_dir`](crate::default_persistent_dir). This field is
+    /// informational: the [`Persistence`] in `persistence` already carries its
+    /// own directory; it is exposed for diagnostics and for `snmpd` to persist
+    /// engine boots separately.
+    pub persistent_dir: Option<PathBuf>,
+    /// Optional notification originator. When set and configured with at least
+    /// one target, the agent emits a `coldStart` trap on startup (matching
+    /// net-snmp's behaviour) and [`Agent::send_notification`] fans notifications
+    /// out to the configured targets. `None` (the default) keeps the agent
+    /// receive-only, exactly as before.
+    pub notify: Option<Arc<NotificationOriginator>>,
 }
 
 impl Default for AgentConfig {
@@ -52,6 +76,9 @@ impl Default for AgentConfig {
             engine_boots: 1,
             users: Vec::new(),
             vacm: None,
+            persistence: None,
+            persistent_dir: None,
+            notify: None,
         }
     }
 }
@@ -61,6 +88,28 @@ impl Default for AgentConfig {
 /// 4 (text), and an `"rs"` discriminator. Stable so discovery is reproducible.
 fn default_engine_id() -> Vec<u8> {
     vec![0x80, 0x00, 0x1f, 0x88, 0x04, b'r', b's', 0x00, 0x01]
+}
+
+impl AgentConfig {
+    /// Attach a [`Persistence`] layer to this config (builder style). The agent
+    /// will [`Persistence::load`] on construction (if items were registered
+    /// beforehand) and expose [`Agent::save_persistent`] for on-shutdown
+    /// flushes. Also records the persistence directory in
+    /// [`AgentConfig::persistent_dir`] for diagnostics.
+    pub fn with_persistence(mut self, p: Arc<Persistence>) -> Self {
+        self.persistent_dir = Some(p.dir().to_path_buf());
+        self.persistence = Some(p);
+        self
+    }
+
+    /// Attach a [`NotificationOriginator`] to this config (builder style). The
+    /// agent will emit a `coldStart` trap on startup (when targets are
+    /// configured) and [`Agent::send_notification`] will fan notifications out
+    /// to them.
+    pub fn with_notify(mut self, originator: Arc<NotificationOriginator>) -> Self {
+        self.notify = Some(originator);
+        self
+    }
 }
 
 /// An SNMP agent: a registry of MIB handlers plus a UDP listener.
@@ -77,6 +126,10 @@ pub struct Agent {
     /// so that agents constructed without VACM behave exactly as before. When
     /// non-empty, per-varbind read/write/notify views are enforced.
     vacm: Arc<Vacm>,
+    /// Optional persistence layer (see [`AgentConfig::persistence`]).
+    persistence: Option<Arc<Persistence>>,
+    /// Optional notification originator (see [`AgentConfig::notify`]).
+    notify: Option<Arc<NotificationOriginator>>,
 }
 
 impl Agent {
@@ -88,6 +141,8 @@ impl Agent {
             .map(|u| (u.name.as_bytes().to_vec(), u.clone()))
             .collect();
         let vacm = config.vacm.clone().unwrap_or_else(|| Arc::new(Vacm::new()));
+        let persistence = config.persistence.clone();
+        let notify = config.notify.clone();
         Agent {
             registry: Arc::new(registry),
             config,
@@ -95,6 +150,8 @@ impl Agent {
             boot_time: Instant::now(),
             usm_stats: AtomicU32::new(0),
             vacm,
+            persistence,
+            notify,
         }
     }
 
@@ -111,6 +168,82 @@ impl Agent {
     /// methods take effect immediately for subsequent requests.
     pub fn vacm(&self) -> &Vacm {
         &self.vacm
+    }
+
+    /// Borrow the agent's optional notification originator, if one was
+    /// configured. The originator (and its shared [`NotifyConfig`](crate::notify::NotifyConfig))
+    /// is the same handle the live target/notify MIB tables read, so programmatic
+    /// target changes are immediately visible to walkers.
+    pub fn notify(&self) -> Option<&NotificationOriginator> {
+        self.notify.as_deref()
+    }
+
+    /// Send a notification to every configured target via the agent's
+    /// [`NotificationOriginator`]. Auto-prepends `sysUpTime.0` (the agent's
+    /// elapsed boot time as TimeTicks) and `snmpTrapOID.0` (the `trap_oid`) per
+    /// RFC 3418, then fans the PDU out to each target.
+    ///
+    /// Returns `Ok(())` immediately when no originator is attached (the agent
+    /// is receive-only) or when no targets are configured — neither is an
+    /// error. Per-target failures are logged and swallowed so one dead target
+    /// does not stop the others.
+    pub async fn send_notification(
+        &self,
+        trap_oid: &netsnmp::oid::Oid,
+        varbinds: Vec<netsnmp::pdu::VarBind>,
+    ) -> Result<()> {
+        if let Some(originator) = &self.notify {
+            originator.send(trap_oid, varbinds).await?;
+        }
+        Ok(())
+    }
+
+    /// Emit a startup `coldStart` trap if a notification originator with at
+    /// least one target is attached. Matches net-snmp's behaviour of notifying
+    /// managers on agent restart. Spawned as a background task so it never
+    /// blocks the serve loop; safe to call before [`serve_on`].
+    ///
+    /// [`serve_on`]: Agent::serve_on
+    pub fn emit_startup_cold_start(&self) {
+        if let Some(originator) = &self.notify
+            && originator.has_targets()
+        {
+            let originator = Arc::clone(originator);
+            tokio::spawn(async move {
+                if let Err(e) = originator.send_cold_start().await {
+                    debug!(error = %e, "startup coldStart notification failed");
+                }
+            });
+        }
+    }
+
+    /// Borrow the agent's optional persistence layer, if one was configured.
+    pub fn persistence(&self) -> Option<&Persistence> {
+        self.persistence.as_deref()
+    }
+
+    /// Flush every registered [`Persistable`](crate::Persistable) item to the
+    /// persistent directory. This is a no-op (returning `Ok(())`) when no
+    /// [`Persistence`] was attached. The agent does **not** call this
+    /// automatically: the caller (typically `snmpd` on `SIGTERM`/`SIGINT`)
+    /// must invoke it before exiting so writable scalars and `snmpEngineBoots`
+    /// survive the restart.
+    pub fn save_persistent(&self) -> io::Result<()> {
+        if let Some(p) = &self.persistence {
+            p.save()?;
+        }
+        Ok(())
+    }
+
+    /// Load registered [`Persistable`](crate::Persistable) items from the
+    /// persistent directory into their live handlers. Called by the binary at
+    /// startup *after* handlers are registered (so the items exist to receive
+    /// the restored values). A no-op when no persistence layer is attached.
+    pub fn load_persistent(&self) -> io::Result<()> {
+        if let Some(p) = &self.persistence {
+            p.load()?;
+        }
+        Ok(())
     }
 
     /// Borrow the registry (e.g. to mutate handlers before serving — note the
@@ -311,7 +444,14 @@ impl Agent {
     /// Bind the listener socket, returning it together with its bound address.
     /// Useful for tests that need the ephemeral port chosen by the OS.
     pub async fn bind(&self) -> Result<UdpSocket> {
-        Ok(UdpSocket::bind(&self.config.bind_addr).await?)
+        self.bind_to(&self.config.bind_addr).await
+    }
+
+    /// Bind a UDP listener on an explicit address, independent of
+    /// [`AgentConfig::bind_addr`]. Useful for serving multiple `agentAddress`
+    /// entries from one agent.
+    pub async fn bind_to(&self, addr: &str) -> Result<UdpSocket> {
+        Ok(UdpSocket::bind(addr).await?)
     }
 
     /// Run the async serve loop on an already-bound socket. This never returns
@@ -328,8 +468,12 @@ impl Agent {
         }
     }
 
-    /// Bind and run the serve loop. Equivalent of `snmpd`'s main loop.
+    /// Bind and run the serve loop. Equivalent of `snmpd`'s main loop. When a
+    /// notification originator with configured targets is attached, a
+    /// `coldStart` trap is emitted first (in a background task) to match
+    /// net-snmp's startup-notification behaviour.
     pub async fn serve_forever(&self) -> Result<()> {
+        self.emit_startup_cold_start();
         let socket = self.bind().await?;
         self.serve_on(socket).await
     }

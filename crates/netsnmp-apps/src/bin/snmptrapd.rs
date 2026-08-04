@@ -10,9 +10,13 @@
 use chrono::Local;
 use clap::Parser;
 use netsnmp::usm::UsmUser;
-use netsnmp_agent::{ReceivedNotification, TrapReceiver, TrapReceiverConfig};
+use netsnmp_agent::{
+    FileSink, HandleRule, HandleSink, NotificationLog, ReceivedNotification, StdoutSink,
+    TrapReceiver, TrapReceiverConfig, TrapSink,
+};
 use netsnmp_apps::{AppError, parse_auth_proto, parse_priv_proto};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tracing::info;
 
 /// Receive and display SNMP notifications (traps and informs).
@@ -57,6 +61,33 @@ struct Cli {
     /// Address to bind, e.g. `127.0.0.1:1162` or `0.0.0.0:162`.
     #[arg(value_name = "BIND_ADDR")]
     bind_addr: Option<String>,
+    /// `snmptrapd`-style `-F FORMAT` format string controlling per-notification
+    /// output. Recognised specifiers: `%Y`/`%m`/`%d`/`%H`/`%M`/`%S` (date/time),
+    /// `%t` (epoch), `%T` (sysUpTime), `%W` (peer), `%v` (varbind list), `%N`
+    /// (trap name), `%q` (trap OID numeric), `%%` (literal `%`).
+    #[arg(short = 'F', long = "format")]
+    format: Option<String>,
+    /// Append each notification to `FILE` (in addition to stdout). Mirrors
+    /// `-o FILE` / `-Lf FILE`.
+    #[arg(short = 'o', long = "output")]
+    output: Option<String>,
+    /// Run `COMMAND` when a notification whose trap OID is under `OID` arrives
+    /// (repeatable). The varbinds are fed to the command's stdin as
+    /// `name = value` lines. Mirrors upstream `traphandle OID COMMAND`.
+    #[arg(long = "traphandle", num_args = 2, value_names = ["OID", "COMMAND"])]
+    traphandle: Vec<String>,
+    /// Re-send each received notification to `HOST` using `COMMUNITY` (v2c
+    /// trap). Mirrors upstream `forward COMMUNITY HOST`.
+    #[arg(long = "forward", num_args = 2, value_names = ["COMMUNITY", "HOST"])]
+    forward: Vec<String>,
+    /// Log destination option (mirrors upstream `-L`). `o` = stdout (default),
+    /// `f FILE` = file. Equivalent to supplying `-o FILE` for `f`.
+    #[arg(short = 'L', long = "log")]
+    log: Option<String>,
+    /// Enable the NOTIFICATION-LOG-MIB `nlmLogTable` ring buffer (walkable
+    /// recent-notification history, capacity 1000).
+    #[arg(long = "notiflog")]
+    notiflog: bool,
 }
 
 impl Cli {
@@ -95,18 +126,75 @@ async fn main() -> Result<(), AppError> {
         .iter()
         .flat_map(|d| netsnmp_apps::split_dir_list(d))
         .collect();
-    let mib = netsnmp_apps::load_mib_registry(&mib_dirs).await;
+    let mib = Arc::new(netsnmp_apps::load_mib_registry(&mib_dirs).await);
+
+    // Build the output sinks. `-o FILE` / `-L f FILE` add a FileSink; each
+    // `--traphandle OID CMD` adds a HandleSink rule; `--forward COMM HOST`
+    // adds a ForwardSink. When `-F FORMAT` is given (or any sink is present),
+    // a StdoutSink is also added so the formatted line reaches stdout via
+    // tracing; otherwise the legacy print_notification callback is used.
+    let mut sinks: Vec<Arc<dyn TrapSink>> = Vec::new();
+    let mut handle_sink = HandleSink::new();
+    for pair in cli.traphandle.chunks(2) {
+        if pair.len() == 2 {
+            let oid = mib
+                .translate(&pair[0])
+                .ok_or_else(|| AppError::ParseOid(pair[0].clone()))?;
+            handle_sink = handle_sink.with_rule(HandleRule::new(oid, pair[1].clone()));
+        }
+    }
+    if !handle_sink.is_empty() {
+        sinks.push(Arc::new(handle_sink));
+    }
+    for pair in cli.forward.chunks(2) {
+        if pair.len() == 2 {
+            sinks.push(Arc::new(netsnmp_agent::ForwardSink::new(
+                pair[0].as_bytes().to_vec(),
+                pair[1].clone(),
+            )));
+        }
+    }
+    // Resolve `-o FILE` and `-L f FILE` (both add a FileSink).
+    let mut output_file: Option<String> = cli.output.clone();
+    if let Some(spec) = &cli.log {
+        if let Some(rest) = spec.strip_prefix('f') {
+            output_file = Some(rest.trim().to_string());
+        }
+    }
+    if let Some(path) = &output_file {
+        let file_sink = FileSink::new(path)
+            .map_err(|e| AppError::msg(format!("cannot open output file {path}: {e}")))?;
+        sinks.push(Arc::new(file_sink));
+    }
+
+    let use_sinks = cli.format.is_some() || !sinks.is_empty();
+    if use_sinks {
+        // A StdoutSink renders the formatted (or default) line via tracing.
+        sinks.insert(0, Arc::new(StdoutSink::new()));
+    }
 
     let mut config = TrapReceiverConfig {
         community: Some(cli.community.clone().into_bytes()),
         users: v3_user.iter().cloned().collect(),
+        format: cli.format.clone(),
+        sinks,
         ..TrapReceiverConfig::default()
     };
     if let Some(addr) = &cli.bind_addr {
         config.bind_addr = addr.clone();
     }
 
-    let receiver = TrapReceiver::new(config.clone());
+    // Optional NOTIFICATION-LOG-MIB ring buffer.
+    let notiflog = if cli.notiflog {
+        Some(NotificationLog::new(1000))
+    } else {
+        None
+    };
+
+    let mut receiver = TrapReceiver::new(config.clone()).with_mib(Arc::clone(&mib));
+    if let Some(log) = &notiflog {
+        receiver = receiver.with_notiflog(Arc::clone(log));
+    }
     let socket = receiver
         .bind()
         .await
@@ -128,10 +216,24 @@ async fn main() -> Result<(), AppError> {
             user.security_level()
         );
     }
+    if let Some(fmt) = &cli.format {
+        info!("output format: {fmt:?}");
+    }
 
-    receiver
-        .serve_on(socket, |note, peer| print_notification(&mib, note, peer))
-        .await?;
+    if use_sinks {
+        // Sinks handle output; the callback is a no-op.
+        receiver
+            .serve_on(socket, |_note, _peer| {})
+            .await?;
+    } else {
+        // Legacy path: the callback prints each notification.
+        let mib_for_cb = Arc::clone(&mib);
+        receiver
+            .serve_on(socket, move |note, peer| {
+                print_notification(&mib_for_cb, note, peer)
+            })
+            .await?;
+    }
     Ok(())
 }
 

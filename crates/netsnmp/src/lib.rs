@@ -59,12 +59,14 @@ pub mod message;
 pub mod mib;
 pub mod oid;
 pub mod pdu;
+pub mod sd_daemon;
 pub mod session;
 pub mod smi;
 #[cfg(feature = "tls")]
 pub mod tls;
 pub mod transport;
 pub mod trap;
+pub mod udp_shared;
 pub mod unix_transport;
 pub mod usm;
 pub mod v3;
@@ -79,6 +81,7 @@ pub use message::{Message, Version};
 pub use mib::MibRegistry;
 pub use oid::Oid;
 pub use pdu::{ErrorStatus, Pdu, PduType, VarBind, V1Trap, v1_generic_trap};
+pub use sd_daemon::{SD_LISTEN_FDS_START, listen_fds_env, socket_activated};
 pub use session::{Session, SessionConfig, V3Session};
 #[cfg(feature = "tls")]
 pub use tls::{TlsClient, TlsClientTransport, TlsServer, TlsServerTransport};
@@ -86,6 +89,7 @@ pub use transport::{StreamTransport, TcpServer, TcpTransport, Transport, UdpTran
 pub use trap::{
     Notification, V1Notification, build_v1_trap, parse_v1_trap, v1_generic_trap_to_oid,
 };
+pub use udp_shared::{UdpShared, UdpSharedTransport};
 pub use unix_transport::UnixTransport;
 pub use usm::{AuthProtocol, PrivProtocol, SecurityLevel, UsmUser};
 pub use v3::{EngineParams, ScopedPdu};

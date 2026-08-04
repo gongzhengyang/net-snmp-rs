@@ -59,6 +59,18 @@ pub fn host_name() -> String {
 /// `contact` and `location` seed the writable `sysContact`/`sysLocation`
 /// objects. `start` is the agent start instant used to compute `sysUpTime`.
 pub fn system_handlers(contact: &str, location: &str, start: Instant) -> Vec<Arc<dyn MibHandler>> {
+    system_handlers_with_persistables(contact, location, start).0
+}
+
+/// Like [`system_handlers`] but also returns the writable scalar handlers
+/// (`sysContact`, `sysName`, `sysLocation`) so callers (e.g. `snmpd`) can wrap
+/// them in a [`Persistable`](crate::Persistable) for state that survives
+/// restarts. Returns `(all_handlers, writable_scalars)`.
+pub fn system_handlers_with_persistables(
+    contact: &str,
+    location: &str,
+    start: Instant,
+) -> (Vec<Arc<dyn MibHandler>>, Vec<Arc<ScalarHandler>>) {
     let base = Oid::new(SYSTEM.to_vec());
 
     let sys_descr = Arc::new(FnHandler::scalar(base.child(1), || {
@@ -92,15 +104,16 @@ pub fn system_handlers(contact: &str, location: &str, start: Instant) -> Vec<Arc
     // sysServices: physical(1)+datalink(2)+internet(4)+end-to-end(8)+app(64) = 72.
     let sys_services = Arc::new(ScalarHandler::new(base.child(7), Value::Integer(72)));
 
-    vec![
+    let handlers: Vec<Arc<dyn MibHandler>> = vec![
         sys_descr,
         sys_object_id,
         sys_uptime,
-        sys_contact,
-        sys_name,
-        sys_location,
+        Arc::clone(&sys_contact) as Arc<dyn MibHandler>,
+        Arc::clone(&sys_name) as Arc<dyn MibHandler>,
+        Arc::clone(&sys_location) as Arc<dyn MibHandler>,
         sys_services,
-    ]
+    ];
+    (handlers, vec![sys_contact, sys_name, sys_location])
 }
 
 #[cfg(test)]

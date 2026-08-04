@@ -42,6 +42,8 @@ pub mod callback;
 pub mod handler;
 pub mod helpers;
 pub mod mibgroup;
+pub mod notify;
+pub mod persist;
 pub mod registry;
 pub mod row;
 pub mod scalar;
@@ -56,13 +58,23 @@ pub use helpers::{
 };
 pub use mibgroup::{
     FrameworkMibConfig, SysOrTable, UsmStats, register_framework_mibs, register_system_mibs,
-    register_vacm_mibs, SystemMibConfig,
+    register_system_mibs_with_persistables, register_vacm_mibs, SystemMibConfig,
+};
+pub use notify::{
+    NotifyConfig, NotifyEntry, NotifyType, NotificationOriginator, TargetAddr, TargetParams,
+    COLD_START_OID, WARM_START_OID,
+};
+pub use persist::{
+    EngineBootsPersistable, Persistable, Persistence, ScalarPersistable, default_persistent_dir,
+    load_engine_boots, save_engine_boots,
 };
 pub use registry::{Registry, SecurityContext};
 pub use row::RowStatus;
 pub use scalar::{FnHandler, MapHandler, ScalarHandler};
 pub use trap::{
-    NotifyVersion, ReceivedNotification, TrapDisposition, TrapReceiver, TrapReceiverConfig,
+    FileSink, ForwardSink, HandleRule, HandleSink, NotificationLog, NotifyVersion,
+    ReceivedNotification, StdoutSink, TrapDisposition, TrapReceiver, TrapReceiverConfig, TrapSink,
+    notiflog_handler, register_notiflog_mibs,
 };
 pub use vacm::{
     AccessView, ContextMatch, Vacm, VacmAccess, VacmGroup, VacmView, ViewTreeFamilyType,

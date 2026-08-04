@@ -23,11 +23,16 @@
 
 mod build;
 mod parse;
+mod tsm;
 mod types;
 mod wire;
 
 pub use build::{UsmStat, build_discovery, build_report, build_request, build_response};
 pub use parse::{parse, peek_security};
+pub use tsm::{
+    SECURITY_MODEL_TSM, TsmCertMap, TsmSecurityParams, build_tsm_request, parse_tsm,
+};
+pub use tsm::{CertMapType, CertToTsnEntry, extract_security_name};
 pub use types::{
     DEFAULT_MAX_SIZE, EngineParams, HeaderData, SECURITY_MODEL_USM, ScopedPdu,
     UsmSecurityParameters, V3Message, VERSION_V3,

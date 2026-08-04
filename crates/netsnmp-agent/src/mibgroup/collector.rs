@@ -155,6 +155,26 @@ impl HostCollector {
     }
 }
 
+impl HostCollector {
+    /// Build a default [`HardwareLayer`] over this collector.
+    ///
+    /// Convenience wrapper around
+    /// [`HardwareLayer::default_layer`](crate::hardware::HardwareLayer::default_layer)
+    /// for callers that already hold the `Arc<HostCollector>`. The CPU,
+    /// filesystem and memory defaults read this collector's throttled snapshot
+    /// (no double-collection); the sensor default reads Linux `/sys/class/hwmon`
+    /// (empty elsewhere).
+    ///
+    /// Note: this takes `self: &Arc<Self>` (an `Arc` receiver) because the
+    /// hardware layer's default implementations need to share the collector via
+    /// `Arc`. Callers that only have `&HostCollector` (rare) should use
+    /// [`HardwareLayer::default_layer`](crate::hardware::HardwareLayer::default_layer)
+    /// directly with their own `Arc`.
+    pub fn hardware(self: &Arc<Self>) -> Arc<crate::hardware::HardwareLayer> {
+        crate::hardware::HardwareLayer::default_layer(Arc::clone(self))
+    }
+}
+
 impl State {
     fn refresh_sources(&mut self) {
         self.sys.refresh_specifics(RefreshKind::everything());

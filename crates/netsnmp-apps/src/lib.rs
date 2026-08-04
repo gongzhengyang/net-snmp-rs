@@ -16,6 +16,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 mod addr;
 mod cli;
 mod client;
+pub mod codegen;
 mod error;
 pub mod mgmt;
 mod mib;

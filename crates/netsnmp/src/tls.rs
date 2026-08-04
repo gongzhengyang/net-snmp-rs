@@ -23,7 +23,10 @@ use crate::transport::StreamTransport;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
+use tokio_rustls::rustls::{
+    ClientConfig, RootCertStore, ServerConfig,
+};
+use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 /// A TLS client transport: a [`StreamTransport`] over a client-side TLS stream.
@@ -98,6 +101,41 @@ impl TlsClient {
         })
     }
 
+    /// Build a client that trusts `ca_pem`, validates the peer against
+    /// `server_name`, and additionally presents a client certificate
+    /// (`client_cert_pem` chain + `client_key_pem`) for mutual TLS.
+    ///
+    /// This is the `(D)TLS-TM` client side of RFC 6353: the server may use the
+    /// client certificate to derive a `securityName` via the
+    /// `tlstmCertToTSN` table (see [`crate::v3::tsm`]).
+    pub fn with_client_cert(
+        server_name: &str,
+        ca_pem: &[u8],
+        client_cert_pem: &[u8],
+        client_key_pem: &[u8],
+    ) -> Result<Self> {
+        let mut roots = RootCertStore::empty();
+        for cert in certs_from_pem(ca_pem)? {
+            roots
+                .add(cert)
+                .map_err(|e| Error::Security(format!("invalid CA certificate: {e}")))?;
+        }
+        let client_certs = certs_from_pem(client_cert_pem)?;
+        let client_key = key_from_pem(client_key_pem)?;
+        let config = ClientConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| Error::Security(e.to_string()))?
+            .with_root_certificates(roots)
+            .with_client_auth_cert(client_certs, client_key)
+            .map_err(|e| Error::Security(format!("invalid client certificate/key: {e}")))?;
+        let server_name = ServerName::try_from(server_name.to_owned())
+            .map_err(|e| Error::Security(format!("invalid server name: {e}")))?;
+        Ok(TlsClient {
+            connector: TlsConnector::from(Arc::new(config)),
+            server_name,
+        })
+    }
+
     /// Open a TCP connection to `peer` and complete the TLS handshake.
     pub async fn connect(&self, peer: &str) -> Result<TlsClientTransport> {
         let tcp = TcpStream::connect(peer).await?;
@@ -128,6 +166,39 @@ impl TlsServer {
             .with_safe_default_protocol_versions()
             .map_err(|e| Error::Security(e.to_string()))?
             .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| Error::Security(format!("invalid server certificate/key: {e}")))?;
+        Ok(Arc::new(config))
+    }
+
+    /// Build a rustls [`ServerConfig`] presenting `cert_pem` (a chain) with the
+    /// private key `key_pem`, and **require** a client certificate verified
+    /// against `client_ca_pem` (mutual TLS).
+    ///
+    /// This is the `(D)TLS-TM` server side of RFC 6353: the presented client
+    /// certificate identifies the peer and is mapped to a `securityName` via
+    /// the `tlstmCertToTSN` table (see [`crate::v3::tsm`]). A client that does
+    /// not present a trusted certificate is rejected at the TLS layer.
+    pub fn server_config_with_client_auth(
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        client_ca_pem: &[u8],
+    ) -> Result<Arc<ServerConfig>> {
+        let certs = certs_from_pem(cert_pem)?;
+        let key = key_from_pem(key_pem)?;
+        let mut client_roots = RootCertStore::empty();
+        for cert in certs_from_pem(client_ca_pem)? {
+            client_roots
+                .add(cert)
+                .map_err(|e| Error::Security(format!("invalid client CA certificate: {e}")))?;
+        }
+        let verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
+            .build()
+            .map_err(|e| Error::Security(format!("client cert verifier build failed: {e}")))?;
+        let config = ServerConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| Error::Security(e.to_string()))?
+            .with_client_cert_verifier(verifier)
             .with_single_cert(certs, key)
             .map_err(|e| Error::Security(format!("invalid server certificate/key: {e}")))?;
         Ok(Arc::new(config))

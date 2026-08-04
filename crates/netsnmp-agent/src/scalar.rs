@@ -56,7 +56,7 @@ pub(crate) fn types_compatible(current: &Value, new: &Value) -> bool {
 }
 
 /// A sorted set of instance cells, shared cheaply across requests.
-type CellSnapshot = Arc<Vec<(Oid, Value)>>;
+pub(crate) type CellSnapshot = Arc<Vec<(Oid, Value)>>;
 
 /// A read-only handler whose cells are produced by a closure. This is how live
 /// system data is served (the role of the C `mibgroup/` data collectors): the

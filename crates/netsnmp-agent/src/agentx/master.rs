@@ -705,23 +705,6 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(80)).await;
 
-        struct Fixed;
-        impl crate::agentx::SubagentHandler for Fixed {
-            fn get(&self, oid: &Oid) -> Option<Value> {
-                if oid.as_slice() == [1, 3, 6, 1, 4, 1, 9999, 2, 0] {
-                    Some(Value::Integer(99))
-                } else {
-                    None
-                }
-            }
-            fn get_next(&self, _oid: &Oid) -> Option<(Oid, Value)> {
-                None
-            }
-            fn set(&self, _oid: &Oid, _value: &Value) -> std::result::Result<(), u16> {
-                Ok(())
-            }
-        }
-
         // Connect, register, then immediately close by dropping the subagent.
         {
             let mut sub = Subagent::connect_unix(tmp.to_str().unwrap())

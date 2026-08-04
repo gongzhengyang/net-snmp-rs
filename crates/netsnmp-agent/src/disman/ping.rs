@@ -286,7 +286,6 @@ impl MibHandler for PingResultsHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::MibHandler;
 
     #[test]
     fn build_ping_command_linux_form() {

@@ -482,7 +482,6 @@ impl MibHandler for ExpressionTableHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::MibHandler;
     use crate::scalar::ScalarHandler;
 
     #[test]

@@ -252,7 +252,6 @@ impl MibHandler for TracerouteResultsHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::MibHandler;
 
     #[test]
     fn build_traceroute_command_linux_form() {

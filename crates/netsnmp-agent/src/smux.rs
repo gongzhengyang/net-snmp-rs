@@ -1446,46 +1446,45 @@ mod tests {
 
     /// A minimal mock SMUX peer: connect, send Open, send Register, then
     /// answer one Get with a Response carrying a fixed value.
-    struct MockPeer {
+    async fn mock_peer_run(
+        addr: &str,
+        password: &str,
+        subtree: &Oid,
         value_oid: Oid,
         value: Value,
-    }
-
-    impl MockPeer {
-        async fn run(addr: &str, password: &str, subtree: &Oid, value_oid: Oid, value: Value) {
-            let mut stream = TcpStream::connect(addr).await.unwrap();
-            // Send Open.
-            let open = SmuxOpen {
-                version: 0,
-                identity: subtree.clone(),
-                description: "mock".into(),
-                password: password.into(),
-            };
-            stream.write_all(&open.encode()).await.unwrap();
-            // Send Register.
-            stream
-                .write_all(&encode_register(subtree, 5, 1))
-                .await
-                .unwrap();
-            // Read RRsp.
-            let _rrsp = read_one_pdu(&mut stream).await.unwrap();
-            // Now wait for the forwarded Get and reply.
-            let req = read_one_pdu(&mut stream).await.unwrap();
-            let (tag, content, _) = parse_tlv(&req).unwrap();
-            assert_eq!(tag, PduType::Get.tag());
-            // Decode request-id from the PDU body.
-            let (_, id_buf, _c1) = parse_tlv(content).unwrap();
-            let request_id = parse_integer(id_buf).unwrap() as i32;
-            let resp = Pdu {
-                pdu_type: PduType::Response,
-                request_id,
-                error_status: 0,
-                error_index: 0,
-                variables: vec![VarBind::new(value_oid.clone(), value.clone())],
-                v1_trap: None,
-            };
-            stream.write_all(&encode_snmp_response(&resp)).await.unwrap();
-        }
+    ) {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        // Send Open.
+        let open = SmuxOpen {
+            version: 0,
+            identity: subtree.clone(),
+            description: "mock".into(),
+            password: password.into(),
+        };
+        stream.write_all(&open.encode()).await.unwrap();
+        // Send Register.
+        stream
+            .write_all(&encode_register(subtree, 5, 1))
+            .await
+            .unwrap();
+        // Read RRsp.
+        let _rrsp = read_one_pdu(&mut stream).await.unwrap();
+        // Now wait for the forwarded Get and reply.
+        let req = read_one_pdu(&mut stream).await.unwrap();
+        let (tag, content, _) = parse_tlv(&req).unwrap();
+        assert_eq!(tag, PduType::Get.tag());
+        // Decode request-id from the PDU body.
+        let (_, id_buf, _c1) = parse_tlv(content).unwrap();
+        let request_id = parse_integer(id_buf).unwrap() as i32;
+        let resp = Pdu {
+            pdu_type: PduType::Response,
+            request_id,
+            error_status: 0,
+            error_index: 0,
+            variables: vec![VarBind::new(value_oid.clone(), value.clone())],
+            v1_trap: None,
+        };
+        stream.write_all(&encode_snmp_response(&resp)).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1506,7 +1505,7 @@ mod tests {
         let vo = value_oid.clone();
         let v = value.clone();
         tokio::spawn(async move {
-            MockPeer::run(&addr, "ignored", &sub, vo, v).await;
+            mock_peer_run(&addr, "ignored", &sub, vo, v).await;
         });
         // Give the peer a moment to connect + register.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;

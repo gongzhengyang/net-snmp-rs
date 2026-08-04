@@ -225,7 +225,6 @@ impl MibHandler for LookupResultsHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::MibHandler;
 
     #[test]
     fn build_lookup_target_appends_port() {

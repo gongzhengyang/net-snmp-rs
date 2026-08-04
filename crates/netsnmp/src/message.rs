@@ -10,6 +10,7 @@ use crate::pdu::Pdu;
 use rasn::types::Integer;
 use rasn_snmp::v2::Pdus;
 use rasn_snmp::v2c::Message as CommunityMessage;
+use rasn_snmp::v1;
 
 /// Supported SNMP protocol versions (community-based).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,9 +62,24 @@ impl Message {
     }
 
     /// Serialize the whole message to BER bytes ready for the transport.
+    ///
+    /// SNMPv1 and SNMPv2c share the same outer envelope (version, community,
+    /// PDU). The PDU choice differs: every PDU except the legacy SNMPv1 Trap-PDU
+    /// uses the `rasn-snmp::v2` choice; a v1 Trap-PDU uses the structurally
+    /// distinct `rasn-snmp::v1::Trap`. Both are wrapped in their respective
+    /// `Message` envelope, which share the identical outer SEQUENCE form so the
+    /// wire bytes are interchangeable between v1 and v2c peers for the non-trap
+    /// PDUs.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        // SNMPv1 and SNMPv2c share the same outer envelope (version, community,
-        // PDU); only the version integer differs. The PDU choice covers both.
+        if self.version == Version::V1 && self.pdu.pdu_type == crate::pdu::PduType::TrapV1 {
+            // v1 Trap-PDU: distinct structure, encoded via the v1 codec.
+            let message = v1::Message {
+                version: Integer::from(self.version.code()),
+                community: crate::convert::octet_string(&self.community),
+                data: self.pdu.to_v1_rasn()?,
+            };
+            return Ok(rasn::ber::encode(&message)?);
+        }
         let message = CommunityMessage {
             version: Integer::from(self.version.code()),
             community: crate::convert::octet_string(&self.community),
@@ -73,16 +89,45 @@ impl Message {
     }
 
     /// Parse a message from raw BER bytes received from the transport.
+    ///
+    /// The message is decoded as the v2 community form first; if the PDU tag is
+    /// the SNMPv1 Trap-PDU tag (`0xA4`) — which the v2 `Pdus` choice cannot
+    /// represent — it is re-decoded through the v1 codec so the structured trap
+    /// fields are recovered. This mirrors upstream `snmp_parse`, which handles
+    /// both shapes transparently for community messages.
     pub fn decode(bytes: &[u8]) -> Result<Message> {
-        let message: CommunityMessage<Pdus> = rasn::ber::decode(bytes)?;
-        let version = Version::from_code(int_to_i64(&message.version)?)?;
-        let community = message.community.to_vec();
-        let pdu = Pdu::from_rasn(message.data)?;
-        Ok(Message {
-            version,
-            community,
-            pdu,
-        })
+        // Detect the v1 Trap-PDU by peeking at the PDU tag inside the message
+        // SEQUENCE. The tag sits after version + community; rather than hand-
+        // parse, attempt the v2 codec and fall back to v1 on the choice error.
+        let v2_result: std::result::Result<CommunityMessage<Pdus>, _> =
+            rasn::ber::decode(bytes);
+        match v2_result {
+            Ok(message) => {
+                let version = Version::from_code(int_to_i64(&message.version)?)?;
+                let community = message.community.to_vec();
+                let pdu = Pdu::from_rasn(message.data)?;
+                Ok(Message {
+                    version,
+                    community,
+                    pdu,
+                })
+            }
+            Err(_) => {
+                // Fall back to the v1 codec, which is only reached for the v1
+                // Trap-PDU tag (0xA4) — the one PDU the v2 `Pdus` choice cannot
+                // represent. Every other v1 PDU shares a tag with its v2 form
+                // and is decoded successfully by the v2 path above.
+                let message: v1::Message<v1::Trap> = rasn::ber::decode(bytes)?;
+                let version = Version::from_code(int_to_i64(&message.version)?)?;
+                let community = message.community.to_vec();
+                let pdu = Pdu::from_v1_rasn(message.data)?;
+                Ok(Message {
+                    version,
+                    community,
+                    pdu,
+                })
+            }
+        }
     }
 }
 
@@ -114,6 +159,7 @@ mod tests {
                 "1.3.6.1.2.1.1.5.0".parse().unwrap(),
                 Value::OctetString(b"router1".to_vec()),
             )],
+            v1_trap: None,
         };
         let msg = Message::new(Version::V1, b"private".to_vec(), pdu);
         let bytes = msg.encode().unwrap();

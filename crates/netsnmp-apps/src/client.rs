@@ -202,6 +202,36 @@ impl Client {
         }
     }
 
+    /// Send an unconfirmed SNMPv1 Trap-PDU (fire-and-forget). Only the
+    /// community client supports the legacy v1 Trap-PDU structure; v3 returns an
+    /// error (v3 has no v1-trap equivalent — use the v2 TrapV2 PDU instead).
+    pub async fn send_trap_v1(
+        &mut self,
+        enterprise: &Oid,
+        agent_addr: std::net::Ipv4Addr,
+        generic_trap: u8,
+        specific_trap: u32,
+        uptime: u32,
+        varbinds: Vec<VarBind>,
+    ) -> netsnmp::Result<()> {
+        match self {
+            Client::Community(s) => {
+                s.send_trap_v1(
+                    enterprise,
+                    agent_addr,
+                    generic_trap,
+                    specific_trap,
+                    uptime,
+                    varbinds,
+                )
+                .await
+            }
+            Client::V3(_) => Err(netsnmp::Error::Protocol(
+                "SNMPv1 Trap-PDU is not defined for SNMPv3 (use a v2 TrapV2)".into(),
+            )),
+        }
+    }
+
     /// Send a confirmed InformRequest and await the acknowledging Response.
     pub async fn send_inform(
         &mut self,

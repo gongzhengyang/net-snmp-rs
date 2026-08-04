@@ -49,8 +49,11 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod alarm;
+pub mod callback_transport;
 pub mod config;
 mod convert;
+pub mod default_store;
 pub mod error;
 pub mod message;
 pub mod mib;
@@ -62,21 +65,28 @@ pub mod smi;
 pub mod tls;
 pub mod transport;
 pub mod trap;
+pub mod unix_transport;
 pub mod usm;
 pub mod v3;
 pub mod value;
 
+pub use alarm::{Alarm, AlarmId, AlarmRegistry};
+pub use callback_transport::CallbackTransport;
 pub use config::{Directive, read_app_config};
+pub use default_store::{DsCategory, DsValue, DefaultStore, default_store};
 pub use error::{Error, Result};
 pub use message::{Message, Version};
 pub use mib::MibRegistry;
 pub use oid::Oid;
-pub use pdu::{ErrorStatus, Pdu, PduType, VarBind};
+pub use pdu::{ErrorStatus, Pdu, PduType, VarBind, V1Trap, v1_generic_trap};
 pub use session::{Session, SessionConfig, V3Session};
 #[cfg(feature = "tls")]
 pub use tls::{TlsClient, TlsClientTransport, TlsServer, TlsServerTransport};
 pub use transport::{StreamTransport, TcpServer, TcpTransport, Transport, UdpTransport};
-pub use trap::Notification;
+pub use trap::{
+    Notification, V1Notification, build_v1_trap, parse_v1_trap, v1_generic_trap_to_oid,
+};
+pub use unix_transport::UnixTransport;
 pub use usm::{AuthProtocol, PrivProtocol, SecurityLevel, UsmUser};
 pub use v3::{EngineParams, ScopedPdu};
 pub use value::Value;

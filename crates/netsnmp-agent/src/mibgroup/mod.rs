@@ -21,10 +21,21 @@
 pub mod collector;
 pub mod host;
 pub mod interfaces;
+pub mod snmp_framework;
+pub mod snmp_mpd;
 pub mod system;
+pub mod sysor;
 pub mod ucd;
+pub mod usm_stats;
+
+// Convenience re-exports so callers can write `mibgroup::SysOrTable` etc.
+pub use snmp_framework::{EngineSnapshot, EngineSnapshotProvider};
+pub use snmp_mpd::SnmpMpdStats;
+pub use sysor::SysOrTable;
+pub use usm_stats::UsmStats;
 
 use crate::registry::Registry;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Options for the live MIB modules.
@@ -74,4 +85,58 @@ pub fn register_system_mibs(registry: &mut Registry, config: &SystemMibConfig) {
 
     // UCD-SNMP-MIB: load averages, memory, per-filesystem usage, CPU summary.
     registry.register(ucd::ucd_handler(collector));
+}
+
+/// Configuration for the SNMP framework/engine MIB modules.
+///
+/// These values mirror the authoritative engine state held inside
+/// [`Agent`](crate::Agent). Because that state is private to the agent, the
+/// binary constructs a snapshot here at registration time and supplies a closure
+/// so the framework scalars (`snmpEngineTime`) stay live.
+#[derive(Clone, Debug)]
+pub struct FrameworkMibConfig {
+    /// The authoritative `snmpEngineID` advertised to SNMPv3 peers.
+    pub engine_id: Vec<u8>,
+    /// The authoritative `snmpEngineBoots` counter (>= 1).
+    pub engine_boots: u32,
+    /// The agent start instant, used to derive `snmpEngineTime` and each
+    /// `sysORUpTime` value.
+    pub boot_time: Instant,
+}
+
+/// Register the SNMP framework/engine MIB modules into `registry`:
+///
+/// * SNMP-FRAMEWORK-MIB `snmpEngine` group (`snmpEngineID`/`Boots`/`Time`/
+///   `MaxMessageSize`).
+/// * SNMP-USER-BASED-SM-MIB `usmStats` (six USM error counters).
+/// * SNMP-MPD-MIB `snmpMPDStats` (two dispatch counters).
+/// * SNMPv2-MIB `sysORTable` (the supplied `sysor` table).
+///
+/// `usm_stats` is shared so the agent's v3 path can increment the same counters
+/// that this handler reports. Likewise `sysor` is shared so subsystems can call
+/// [`sysor::SysOrTable::register`] against the same table the handler walks.
+pub fn register_framework_mibs(
+    registry: &mut Registry,
+    fw: &FrameworkMibConfig,
+    sysor: &Arc<sysor::SysOrTable>,
+    usm_stats: &Arc<usm_stats::UsmStats>,
+) {
+    // The engine snapshot is rebuilt on each read so snmpEngineTime advances.
+    let engine_id = fw.engine_id.clone();
+    let engine_boots = fw.engine_boots;
+    let boot_time = fw.boot_time;
+    let provider: snmp_framework::EngineSnapshotProvider = Arc::new(move || {
+        snmp_framework::EngineSnapshot {
+            engine_id: engine_id.clone(),
+            engine_boots,
+            boot_time: Some(boot_time),
+        }
+    });
+    for handler in snmp_framework::snmp_framework_handlers(provider) {
+        registry.register(handler);
+    }
+
+    registry.register(usm_stats::usm_stats_handler(Arc::clone(usm_stats)));
+    registry.register(snmp_mpd::snmp_mpd_handler());
+    registry.register(sysor::sysor_handler(Arc::clone(sysor)));
 }

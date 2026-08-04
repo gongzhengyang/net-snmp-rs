@@ -5,6 +5,7 @@ use crate::message::{Message, Version};
 use crate::oid::Oid;
 use crate::pdu::{Pdu, PduType, VarBind};
 use crate::transport::{TcpTransport, Transport, UdpTransport};
+use crate::unix_transport::UnixTransport;
 use crate::value::Value;
 use futures::stream::{Stream, TryStreamExt};
 use tokio::time::timeout;
@@ -31,6 +32,17 @@ impl Session<TcpTransport> {
     /// Open a TCP session to `peer` (host:port), using `snmpTCPDomain` framing.
     pub async fn open_tcp(peer: &str, config: SessionConfig) -> Result<Self> {
         let transport = TcpTransport::connect(peer).await?;
+        Ok(Session { transport, config })
+    }
+}
+
+impl Session<UnixTransport> {
+    /// Open a Unix-domain socket session to `path` (e.g.
+    /// `"/var/run/snmpd.sock"` or `"unix:/var/run/snmpd.sock"`), using the
+    /// same BER `SEQUENCE` framing as `snmpTCPDomain`. Counterpart of
+    /// `snmpUnixDomain`.
+    pub async fn open_unix(path: &str, config: SessionConfig) -> Result<Self> {
+        let transport = UnixTransport::connect(path).await?;
         Ok(Session { transport, config })
     }
 }
@@ -180,8 +192,8 @@ impl<T: Transport> Session<T> {
     }
 
     /// Send an unconfirmed SNMPv2-Trap notification (fire-and-forget; no reply
-    /// is awaited). Mirrors `snmptrap`. Requires SNMPv2c (the legacy v1 Trap-PDU
-    /// is not supported).
+    /// is awaited). Mirrors `snmptrap`. Requires SNMPv2c (for an SNMPv1 trap use
+    /// [`send_trap_v1`](Self::send_trap_v1)).
     pub async fn send_trap(
         &self,
         sys_uptime: u32,
@@ -190,7 +202,7 @@ impl<T: Transport> Session<T> {
     ) -> Result<()> {
         if self.config.version == Version::V1 {
             return Err(Error::Protocol(
-                "SNMPv1 traps are not supported (use -v 2c)".into(),
+                "SNMPv1 session: use send_trap_v1 (not send_trap)".into(),
             ));
         }
         let pdu = crate::trap::build_notification(
@@ -201,6 +213,39 @@ impl<T: Transport> Session<T> {
             varbinds,
         )?;
         let msg = Message::new(self.config.version, self.config.community.clone(), pdu);
+        self.transport.send(&msg.encode()?).await
+    }
+
+    /// Send an unconfirmed SNMPv1 Trap-PDU notification (fire-and-forget; no
+    /// reply is awaited). Requires SNMPv1 (the v1 Trap-PDU is structurally
+    /// distinct from the v2c Trap-PDU). Mirrors the v1 form of `snmptrap`.
+    ///
+    /// `agent_addr` of `0.0.0.0` is conventional when the sender has no specific
+    /// address to report. The trap is identified by `enterprise` +
+    /// `generic_trap` (+ `specific_trap` for enterprise-specific traps).
+    pub async fn send_trap_v1(
+        &self,
+        enterprise: &Oid,
+        agent_addr: std::net::Ipv4Addr,
+        generic_trap: u8,
+        specific_trap: u32,
+        uptime: u32,
+        varbinds: Vec<VarBind>,
+    ) -> Result<()> {
+        if self.config.version != Version::V1 {
+            return Err(Error::Protocol(
+                "send_trap_v1 requires SNMPv1 (use -v 1)".into(),
+            ));
+        }
+        let pdu = crate::trap::build_v1_trap(
+            enterprise.clone(),
+            agent_addr,
+            generic_trap,
+            specific_trap,
+            uptime,
+            varbinds,
+        );
+        let msg = Message::new(Version::V1, self.config.community.clone(), pdu);
         self.transport.send(&msg.encode()?).await
     }
 

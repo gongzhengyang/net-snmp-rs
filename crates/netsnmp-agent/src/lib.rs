@@ -36,6 +36,7 @@
 #![warn(missing_docs)]
 
 pub mod agent;
+pub mod callback;
 pub mod handler;
 pub mod mibgroup;
 pub mod registry;
@@ -43,8 +44,12 @@ pub mod scalar;
 pub mod trap;
 
 pub use agent::{Agent, AgentConfig};
+pub use callback::CallbackBus;
 pub use handler::{MibHandler, Mode, Reading};
-pub use mibgroup::{SystemMibConfig, register_system_mibs};
+pub use mibgroup::{
+    FrameworkMibConfig, SysOrTable, UsmStats, register_framework_mibs, register_system_mibs,
+    SystemMibConfig,
+};
 pub use registry::Registry;
 pub use scalar::{FnHandler, MapHandler, ScalarHandler};
 pub use trap::{

@@ -131,16 +131,75 @@ async fn snmptrap_inform_is_acknowledged() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn snmptrap_rejects_v1() {
-    // SNMPv1 traps are not supported by this implementation.
-    let (addr, _rx) = spawn_receiver("public").await;
+async fn snmptrap_sends_v1_trap() {
+    // SNMPv1 Trap-PDU end-to-end: the CLI builds the legacy Trap-PDU and the
+    // in-process receiver decodes it, translating enterprise-specific traps to
+    // snmpTrapOID = enterprise.0.<specific> per RFC 3584.
+    let (addr, mut rx) = spawn_receiver("public").await;
+
+    let enterprise = "1.3.6.1.4.1.8072.2";
     let out = run_async(
         "snmptrap",
-        &["-v", "1", "-c", "public", &addr, "1", COLD_START],
+        &[
+            "-v",
+            "1",
+            "-c",
+            "public",
+            &addr,
+            enterprise,
+            "127.0.0.1",
+            "6", // enterpriseSpecific
+            "1", // specific trap number
+            "300", // uptime
+        ],
         &[],
     )
     .await;
-    out.assert_failure("snmptrap v1");
+    out.assert_success("snmptrap v1");
+    assert!(out.combined().contains("v1 trap sent"), "output: {}", out.combined());
+
+    let got = timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timed out waiting for v1 trap")
+        .expect("receiver channel closed");
+    assert_eq!(got.uptime, 300);
+    assert!(!got.confirmed);
+    // enterpriseSpecific(6) → enterprise.0.<specific>
+    assert!(
+        got.trap_oid.ends_with(&format!("{enterprise}.0.1")),
+        "unexpected translated trap OID: {}",
+        got.trap_oid
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snmptrap_sends_v1_generic_trap_maps_to_snmpTraps() {
+    // A v1 generic trap (linkDown = 2) maps to snmpTraps.2 (coldStart is .1).
+    let (addr, mut rx) = spawn_receiver("public").await;
+    let out = run_async(
+        "snmptrap",
+        &[
+            "-v",
+            "1",
+            "-c",
+            "public",
+            &addr,
+            "1.3.6.1.4.1.8072.2", // enterprise (irrelevant for a generic trap)
+            "0.0.0.0",
+            "2", // linkDown
+            "0",
+            "99",
+        ],
+        &[],
+    )
+    .await;
+    out.assert_success("snmptrap v1 generic");
+    let got = timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timed out waiting for v1 generic trap")
+        .expect("receiver channel closed");
+    // linkDown → 1.3.6.1.6.3.1.1.5.2
+    assert!(got.trap_oid.ends_with("1.3.6.1.6.3.1.1.5.2"), "got: {}", got.trap_oid);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

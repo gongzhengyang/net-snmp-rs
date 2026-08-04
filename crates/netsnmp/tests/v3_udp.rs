@@ -56,6 +56,7 @@ async fn spawn_engine(user: UsmUser) -> String {
                         "1.3.6.1.6.3.15.1.1.4.0".parse::<Oid>().unwrap(),
                         Value::Counter32(1),
                     )],
+                    v1_trap: None,
                 };
                 let noauth = UsmUser::noauth("");
                 v3::build_request(msg.header.msg_id, &noauth, &engine, &[], report)

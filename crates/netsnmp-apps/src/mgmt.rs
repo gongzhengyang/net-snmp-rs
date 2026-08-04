@@ -24,13 +24,41 @@ pub mod row_status {
     pub const DESTROY: i64 = 6;
 }
 
+/// SNMPv2-TC StorageType enumeration values (used by `usmUserStorageType` and
+/// the VACM tables).
+pub mod storage_type {
+    /// `other(1)`.
+    pub const OTHER: i64 = 1;
+    /// `volatile(2)`.
+    pub const VOLATILE: i64 = 2;
+    /// `nonVolatile(3)`.
+    pub const NON_VOLATILE: i64 = 3;
+    /// `permanent(4)`.
+    pub const PERMANENT: i64 = 4;
+    /// `readOnly(5)`.
+    pub const READ_ONLY: i64 = 5;
+}
+
 // ---------------------------------------------------------------------------
 // Table entry OIDs
 // ---------------------------------------------------------------------------
-const USM_USER_ENTRY: &str = "1.3.6.1.6.3.15.1.2.2.1";
-const VACM_SEC2GROUP_ENTRY: &str = "1.3.6.1.6.3.16.1.2.1";
-const VACM_ACCESS_ENTRY: &str = "1.3.6.1.6.3.16.1.4.1";
-const VACM_VIEW_ENTRY: &str = "1.3.6.1.6.3.16.1.5.2.1";
+
+/// `usmUserEntry` OID (`1.3.6.1.6.3.15.1.2.2.1`) — root of `usmUserTable`.
+/// Public so the tools can issue GETNEXT walks for `list`.
+pub const USM_USER_ENTRY_OID: &str = "1.3.6.1.6.3.15.1.2.2.1";
+/// `vacmSecurityToGroupEntry` OID (`1.3.6.1.6.3.16.1.2.1`) — root of
+/// `vacmSecurityToGroupTable`.
+pub const VACM_SEC2GROUP_ENTRY_OID: &str = "1.3.6.1.6.3.16.1.2.1";
+/// `vacmAccessEntry` OID (`1.3.6.1.6.3.16.1.4.1`) — root of `vacmAccessTable`.
+pub const VACM_ACCESS_ENTRY_OID: &str = "1.3.6.1.6.3.16.1.4.1";
+/// `vacmViewTreeFamilyEntry` OID (`1.3.6.1.6.3.16.1.5.2.1`) — root of
+/// `vacmViewTreeFamilyTable`.
+pub const VACM_VIEW_ENTRY_OID: &str = "1.3.6.1.6.3.16.1.5.2.1";
+
+const USM_USER_ENTRY: &str = USM_USER_ENTRY_OID;
+const VACM_SEC2GROUP_ENTRY: &str = VACM_SEC2GROUP_ENTRY_OID;
+const VACM_ACCESS_ENTRY: &str = VACM_ACCESS_ENTRY_OID;
+const VACM_VIEW_ENTRY: &str = VACM_VIEW_ENTRY_OID;
 
 fn entry(s: &str) -> Oid {
     s.parse().expect("valid table entry OID")
@@ -57,8 +85,30 @@ pub fn oid_index(oid: &Oid) -> Vec<u32> {
 // ---------------------------------------------------------------------------
 // usmUserTable (SNMP-USER-BASED-SM-MIB)
 // ---------------------------------------------------------------------------
+
+// Column numbers inside usmUserEntry (see SNMP-USER-BASED-SM-MIB):
+//   2 = usmUserName        (not-accessible, part of the index)
+//   3 = usmUserSecurityName (read-only)
+//   4 = usmUserCloneFrom
+//   5 = usmUserAuthProtocol
+//   8 = usmUserPrivProtocol
+//   6 = usmUserStorageType
+//  13 = usmUserStatus
+const USM_SECURITY_NAME: u32 = 3;
 const USM_CLONE_FROM: u32 = 4;
+const USM_AUTH_PROTOCOL: u32 = 5;
+const USM_PRIV_PROTOCOL: u32 = 8;
 const USM_STATUS: u32 = 13;
+
+/// The `usmUserSecurityName` column number, exposed for tools that walk
+/// `usmUserTable` and label rows.
+pub const USM_SECURITY_NAME_COL: u32 = USM_SECURITY_NAME;
+/// The `usmUserAuthProtocol` column number.
+pub const USM_AUTH_PROTOCOL_COL: u32 = USM_AUTH_PROTOCOL;
+/// The `usmUserPrivProtocol` column number.
+pub const USM_PRIV_PROTOCOL_COL: u32 = USM_PRIV_PROTOCOL;
+/// The `usmUserStatus` column number.
+pub const USM_STATUS_COL: u32 = USM_STATUS;
 
 /// INDEX for `usmUserTable`: { usmUserEngineID, usmUserName }, both
 /// variable-length OCTET STRINGs.
@@ -66,6 +116,33 @@ pub fn usm_user_index(engine_id: &[u8], user: &str) -> Vec<u32> {
     let mut idx = string_index(engine_id);
     idx.extend(string_index(user.as_bytes()));
     idx
+}
+
+/// Best-effort extraction of the `usmUserName` portion from a `usmUserTable`
+/// row index — the trailing ASCII bytes after the length-prefixed
+/// `usmUserEngineID`. The index layout is:
+/// `engineId_len engineId... user_len user_bytes...`. Returns the user name as
+/// a lossy UTF-8 string, or `None` when the index is too short to be valid.
+pub fn parse_usm_user_name(index: &[u32]) -> Option<String> {
+    if index.is_empty() {
+        return None;
+    }
+    let engine_len = index[0] as usize;
+    let need = engine_len.checked_add(1)?;
+    if index.len() < need {
+        return None;
+    }
+    let rest = &index[need..];
+    if rest.is_empty() {
+        return None;
+    }
+    let name_len = rest[0] as usize;
+    let name_end = 1usize.checked_add(name_len)?;
+    if rest.len() < name_end {
+        return None;
+    }
+    let bytes: Vec<u8> = rest[1..name_end].iter().map(|&v| v as u8).collect();
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Build the SET bindings to create a USM user by cloning an existing template
@@ -91,6 +168,37 @@ pub fn usm_create(engine_id: &[u8], user: &str, clone_from: &str) -> Vec<VarBind
 pub fn usm_security_name_oid(engine_id: &[u8], template_user: &str) -> Oid {
     let entry = entry(USM_USER_ENTRY);
     cell_oid(&entry, 3, &usm_user_index(engine_id, template_user))
+}
+
+/// Build the SET binding to point a (yet to be created) user's
+/// `usmUserCloneFrom` at the `usmUserSecurityName` instance of an existing
+/// template user. Used as the first step of the explicit `cloneFrom` operation;
+/// the caller follows up with a `usm_set_status(createAndGo)`.
+pub fn usm_clone_from(engine_id: &[u8], user: &str, template_sec_name_oid: Oid) -> VarBind {
+    let entry = entry(USM_USER_ENTRY);
+    let index = usm_user_index(engine_id, user);
+    VarBind::new(
+        cell_oid(&entry, USM_CLONE_FROM, &index),
+        Value::Oid(template_sec_name_oid),
+    )
+}
+
+/// `usmUserStorageType` — column 6 of `usmUserEntry` (see
+/// SNMP-USER-BASED-SM-MIB). Build the SET binding for `lock` (readOnly = 5) /
+/// `unlock` (volatile = 2) and similar storage-type transitions.
+pub const USM_STORAGE_TYPE: u32 = 6;
+
+/// Build the SET binding that writes a USM user's `usmUserStorageType`.
+///
+/// Typical values follow SNMPv2-TC `StorageType`: `2` = volatile (unlock),
+/// `5` = readOnly (lock).
+pub fn usm_storage_type(engine_id: &[u8], user: &str, value: i64) -> VarBind {
+    let entry = entry(USM_USER_ENTRY);
+    let index = usm_user_index(engine_id, user);
+    VarBind::new(
+        cell_oid(&entry, USM_STORAGE_TYPE, &index),
+        Value::Integer(value),
+    )
 }
 
 /// Build the SET binding to remotely change a user's localized auth or privacy
@@ -131,6 +239,22 @@ const VACM_ACCESS_STATUS: u32 = 9;
 const VACM_VIEW_MASK: u32 = 3;
 const VACM_VIEW_TYPE: u32 = 4;
 const VACM_VIEW_STATUS: u32 = 6;
+
+/// Column numbers used by the VACM `list` walks. Exposed so the tools can label
+/// cells without re-deriving them.
+pub mod vacm_cols {
+    use super::*;
+    /// `vacmSecurityToGroupGroupName` (col 3 of vacmSecurityToGroupEntry).
+    pub const S2G_GROUP_NAME: u32 = VACM_GROUP_NAME;
+    /// `vacmViewTreeFamilySubtree` is part of the index.
+    /// `vacmViewTreeFamilyType` (col 4 of vacmViewTreeFamilyEntry).
+    pub const VIEW_TYPE: u32 = VACM_VIEW_TYPE;
+    /// `vacmAccessContextMatch` (col 4), `vacmAccessReadViewName` (col 5),
+    /// `vacmAccessWriteViewName` (col 6), `vacmAccessNotifyViewName` (col 7).
+    pub const ACCESS_READ_VIEW: u32 = VACM_ACCESS_READ_VIEW;
+    pub const ACCESS_WRITE_VIEW: u32 = VACM_ACCESS_WRITE_VIEW;
+    pub const ACCESS_NOTIFY_VIEW: u32 = VACM_ACCESS_NOTIFY_VIEW;
+}
 
 /// View tree family type: included or excluded.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

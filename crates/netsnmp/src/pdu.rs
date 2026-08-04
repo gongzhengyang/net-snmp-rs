@@ -3,15 +3,18 @@
 //! Rust counterpart of the PDU structures in `snmp.h` / `snmp_api.c` and the
 //! request/response processing in `snmp_client.c`.
 
-use crate::convert::{oid_from_rasn, oid_to_rasn};
+use crate::convert::{int_to_i64, oid_from_rasn, oid_to_rasn};
 use crate::error::{Error, Result};
 use crate::oid::Oid;
 use crate::value::Value;
+use rasn::types::Integer;
 use rasn_snmp::v2::{
     BulkPdu, GetBulkRequest, GetNextRequest, GetRequest, InformRequest, Pdu as RasnPdu, Pdus,
     Report, Response, SetRequest, Trap, VarBind as RasnVarBind,
 };
+use rasn_snmp::v1;
 use std::fmt;
+use std::net::Ipv4Addr;
 
 /// The SNMP PDU type (the context-specific constructed tag, low nibble).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,6 +237,218 @@ impl VarBind {
     }
 }
 
+/// Generic-trap numbers for the SNMPv1 Trap-PDU (RFC 1157 §4.1.6).
+///
+/// Values `0..=6` are the standard well-known traps; values `>= 7` are not
+/// defined by the standard and are carried as-is for enterprise-specific use
+/// (where the meaning is given by `enterprise` + `specific_trap`).
+pub mod v1_generic_trap {
+    /// `coldStart` — the agent reinitialised itself.
+    pub const COLD_START: u8 = 0;
+    /// `warmStart` — the agent reinitialised but kept its configuration.
+    pub const WARM_START: u8 = 1;
+    /// `linkDown` — a connected interface went down.
+    pub const LINK_DOWN: u8 = 2;
+    /// `linkUp` — a connected interface came up.
+    pub const LINK_UP: u8 = 3;
+    /// `authenticationFailure` — a received message failed community auth.
+    pub const AUTH_FAILURE: u8 = 4;
+    /// `egpNeighborLoss` — an EGP neighbour went down.
+    pub const EGP_NEIGHBOR_LOSS: u8 = 5;
+    /// `enterpriseSpecific` — the meaning comes from `specific_trap`.
+    pub const ENTERPRISE_SPECIFIC: u8 = 6;
+}
+
+/// The legacy SNMPv1 Trap-PDU payload (RFC 1157 §4.1.6).
+///
+/// Unlike the v2c/v3 notification PDUs, the v1 Trap-PDU is structurally
+/// distinct: it carries enterprise/generic-trap/specific-trap/agent-addr fields
+/// directly in the PDU rather than as varbinds. This type models those fields;
+/// it is held on [`Pdu::v1_trap`] whenever `pdu_type == TrapV1`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V1Trap {
+    /// The enterprise OID under which the trap is defined. By convention the
+    /// generic traps live under `1.3.6.1.6.3.1.1.5`; enterprise-specific traps
+    /// append `specific_trap` to this value.
+    pub enterprise: Oid,
+    /// The address of the originator. `0.0.0.0` (the default) lets the receiver
+    /// fill it from the transport; the sender may also set it explicitly.
+    pub agent_addr: Ipv4Addr,
+    /// The generic-trap number; see [`v1_generic_trap`].
+    pub generic_trap: u8,
+    /// The enterprise-specific trap number (meaningful only when
+    /// `generic_trap == enterpriseSpecific`).
+    pub specific_trap: u32,
+    /// Elapsed time since the agent reinitialised (hundredths of a second).
+    pub time_stamp: u32,
+}
+
+impl V1Trap {
+    /// Construct a v1 trap payload.
+    pub fn new(
+        enterprise: Oid,
+        agent_addr: Ipv4Addr,
+        generic_trap: u8,
+        specific_trap: u32,
+        time_stamp: u32,
+    ) -> Self {
+        V1Trap {
+            enterprise,
+            agent_addr,
+            generic_trap,
+            specific_trap,
+            time_stamp,
+        }
+    }
+
+    /// Convert into the `rasn-snmp` v1 [`Trap`](v1::Trap) PDU body.
+    pub(crate) fn to_rasn(&self, variable_bindings: Vec<v1::VarBind>) -> Result<v1::Trap> {
+        Ok(v1::Trap {
+            enterprise: oid_to_rasn(&self.enterprise)?,
+            agent_addr: smi_v1_internet_addr(self.agent_addr),
+            generic_trap: Integer::from(self.generic_trap as i64),
+            specific_trap: Integer::from(self.specific_trap as i64),
+            time_stamp: rasn_smi_v1_time_ticks(self.time_stamp),
+            variable_bindings,
+        })
+    }
+
+    /// Build a [`V1Trap`] plus the carried v1 varbind list from a decoded
+    /// `rasn-snmp` v1 [`Trap`](v1::Trap).
+    pub(crate) fn from_rasn(rasn: v1::Trap) -> Result<(V1Trap, Vec<v1::VarBind>)> {
+        let agent_addr = match rasn.agent_addr {
+            rasn_smi::v1::NetworkAddress::Internet(ip) => {
+                // `FixedOctetString<4>` implements `AsRef<[u8]>`.
+                let bytes: [u8; 4] = ip.0.as_ref().try_into().expect("IpAddress is 4 octets");
+                Ipv4Addr::from(bytes)
+            }
+        };
+        let generic = int_to_i64(&rasn.generic_trap)?;
+        let specific = int_to_i64(&rasn.specific_trap)?;
+        let trap = V1Trap {
+            enterprise: oid_from_rasn(&rasn.enterprise),
+            agent_addr,
+            generic_trap: u8::try_from(generic).map_err(|_| {
+                Error::Protocol(format!("v1 generic_trap out of range: {generic}"))
+            })?,
+            specific_trap: u32::try_from(specific).map_err(|_| {
+                Error::Protocol(format!("v1 specific_trap out of range: {specific}"))
+            })?,
+            time_stamp: rasn_smi_v1_time_ticks_value(&rasn.time_stamp),
+        };
+        Ok((trap, rasn.variable_bindings))
+    }
+}
+
+/// Build an SMIv1 `NetworkAddress::Internet(IpAddress(..))` for an IPv4 address.
+fn smi_v1_internet_addr(addr: Ipv4Addr) -> rasn_smi::v1::NetworkAddress {
+    rasn_smi::v1::NetworkAddress::Internet(rasn_smi::v1::IpAddress(addr.octets().into()))
+}
+
+/// Wrap a centisecond count as an SMIv1 `TimeTicks`.
+fn rasn_smi_v1_time_ticks(ticks: u32) -> rasn_smi::v1::TimeTicks {
+    rasn_smi::v1::TimeTicks(ticks)
+}
+
+/// Read the centisecond value out of an SMIv1 `TimeTicks`.
+fn rasn_smi_v1_time_ticks_value(ticks: &rasn_smi::v1::TimeTicks) -> u32 {
+    ticks.0
+}
+
+/// Convert a list of domain [`VarBind`]s into the SMIv1 `ObjectSyntax` form used
+/// by the v1 Trap-PDU. v1 has no exception markers, so every value becomes a
+/// plain `ObjectSyntax`; the domain `Value` never carries an exception marker
+/// in a v1 trap built by this crate (a `NoSuch*`/`EndOfMibView` is mapped to
+/// NULL, matching upstream behaviour where v1 traps only carry real values).
+pub(crate) fn varbinds_to_v1(varbinds: &[VarBind]) -> Result<Vec<v1::VarBind>> {
+    varbinds
+        .iter()
+        .map(|vb| -> Result<v1::VarBind> {
+            Ok(v1::VarBind {
+                name: oid_to_rasn(&vb.oid)?,
+                value: value_to_v1_object_syntax(&vb.value)?,
+            })
+        })
+        .collect()
+}
+
+/// Parse a list of SMIv1 varbinds back into domain [`VarBind`]s.
+pub(crate) fn varbinds_from_v1(vbs: Vec<v1::VarBind>) -> Result<Vec<VarBind>> {
+    vbs.into_iter()
+        .map(|vb| -> Result<VarBind> {
+            Ok(VarBind {
+                oid: oid_from_rasn(&vb.name),
+                value: value_from_v1_object_syntax(vb.value),
+            })
+        })
+        .collect()
+}
+
+/// Map a domain [`Value`] to an SMIv1 `ObjectSyntax`. Exception markers collapse
+/// to `Empty` (the v1 spelling of NULL) since the v1 Trap-PDU cannot carry them.
+fn value_to_v1_object_syntax(value: &Value) -> Result<rasn_smi::v1::ObjectSyntax> {
+    use rasn_smi::v1::{ApplicationSyntax, ObjectSyntax, SimpleSyntax};
+    let syntax = match value {
+        Value::Integer(v) => ObjectSyntax::Simple(SimpleSyntax::Number(Integer::from(*v))),
+        Value::OctetString(b) => {
+            ObjectSyntax::Simple(SimpleSyntax::String(crate::convert::octet_string(b)))
+        }
+        Value::Oid(o) => ObjectSyntax::Simple(SimpleSyntax::Object(oid_to_rasn(o)?)),
+        // v1 SimpleSyntax has no Empty variant spelled as NULL-by-value, but the
+        // enum carries `Empty`; map NULL and the v2 exception markers to it.
+        Value::Null
+        | Value::NoSuchObject
+        | Value::NoSuchInstance
+        | Value::EndOfMibView => ObjectSyntax::Simple(SimpleSyntax::Empty),
+        Value::IpAddress(ip) => ObjectSyntax::ApplicationWide(ApplicationSyntax::Address(
+            rasn_smi::v1::NetworkAddress::Internet(rasn_smi::v1::IpAddress(ip.octets().into())),
+        )),
+        Value::Counter32(v) => {
+            ObjectSyntax::ApplicationWide(ApplicationSyntax::Counter(rasn_smi::v1::Counter(*v)))
+        }
+        Value::Gauge32(v) => {
+            ObjectSyntax::ApplicationWide(ApplicationSyntax::Gauge(rasn_smi::v1::Gauge(*v)))
+        }
+        Value::TimeTicks(v) => ObjectSyntax::ApplicationWide(ApplicationSyntax::Ticks(
+            rasn_smi::v1::TimeTicks(*v),
+        )),
+        Value::Opaque(b) => ObjectSyntax::ApplicationWide(ApplicationSyntax::Arbitrary(
+            crate::convert::opaque_from_bytes(b)?,
+        )),
+        // Counter64 does not exist in SMIv1; carry it as a Gauge (best effort,
+        // same as upstream's v1 path) since v1 traps rarely carry 64-bit stats.
+        Value::Counter64(v) => ObjectSyntax::ApplicationWide(ApplicationSyntax::Gauge(
+            rasn_smi::v1::Gauge(u32::try_from(*v).unwrap_or(u32::MAX)),
+        )),
+    };
+    Ok(syntax)
+}
+
+/// Map an SMIv1 `ObjectSyntax` back to a domain [`Value`].
+fn value_from_v1_object_syntax(syntax: rasn_smi::v1::ObjectSyntax) -> Value {
+    use rasn_smi::v1::{ApplicationSyntax, ObjectSyntax, SimpleSyntax};
+    match syntax {
+        ObjectSyntax::Simple(SimpleSyntax::Number(i)) => {
+            Value::Integer(crate::convert::int_to_i64(&i).unwrap_or(0))
+        }
+        ObjectSyntax::Simple(SimpleSyntax::String(s)) => Value::OctetString(s.to_vec()),
+        ObjectSyntax::Simple(SimpleSyntax::Object(o)) => Value::Oid(oid_from_rasn(&o)),
+        ObjectSyntax::Simple(SimpleSyntax::Empty) => Value::Null,
+        ObjectSyntax::ApplicationWide(ApplicationSyntax::Address(addr)) => match addr {
+            rasn_smi::v1::NetworkAddress::Internet(ip) => {
+                let bytes: [u8; 4] = ip.0.as_ref().try_into().expect("IpAddress is 4 octets");
+                Value::IpAddress(std::net::Ipv4Addr::from(bytes))
+            }
+        },
+        ObjectSyntax::ApplicationWide(ApplicationSyntax::Counter(c)) => Value::Counter32(c.0),
+        ObjectSyntax::ApplicationWide(ApplicationSyntax::Gauge(g)) => Value::Gauge32(g.0),
+        ObjectSyntax::ApplicationWide(ApplicationSyntax::Ticks(t)) => Value::TimeTicks(t.0),
+        ObjectSyntax::ApplicationWide(ApplicationSyntax::Arbitrary(op)) => {
+            Value::Opaque(op.as_ref().to_vec())
+        }
+    }
+}
+
 /// A complete SNMP PDU (everything inside the message wrapper).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pdu {
@@ -247,6 +462,10 @@ pub struct Pdu {
     pub error_index: i64,
     /// The variable bindings.
     pub variables: Vec<VarBind>,
+    /// The structured payload of an SNMPv1 Trap-PDU. `None` for every other PDU
+    /// type. For a v1 trap the [`V1Trap`] fields are authoritative and
+    /// [`Pdu::variables`] additionally carries the trap's trailing varbinds.
+    pub v1_trap: Option<V1Trap>,
 }
 
 impl Pdu {
@@ -258,6 +477,23 @@ impl Pdu {
             error_status: 0,
             error_index: 0,
             variables: Vec::new(),
+            v1_trap: None,
+        }
+    }
+
+    /// Create an SNMPv1 Trap-PDU. The trap's trailing varbinds go into
+    /// [`Pdu::variables`]; the structured trap fields live on the returned
+    /// PDU's [`v1_trap`](Pdu::v1_trap) slot. `request_id` is unused on the v1
+    /// wire (the Trap-PDU has no request-id field) but kept here for uniform
+    /// logging; pass `0`.
+    pub fn new_v1_trap(trap: V1Trap, varbinds: Vec<VarBind>) -> Self {
+        Pdu {
+            pdu_type: PduType::TrapV1,
+            request_id: 0,
+            error_status: 0,
+            error_index: 0,
+            variables: varbinds,
+            v1_trap: Some(trap),
         }
     }
 
@@ -291,9 +527,10 @@ impl Pdu {
     /// Convert into the `rasn-snmp` PDU choice, ready to be wrapped in a message
     /// and BER-encoded.
     ///
-    /// Returns [`Error::Protocol`] for the legacy SNMPv1 Trap-PDU, which has a
-    /// distinct structure and is intentionally not built here (matching the
-    /// crate's v2c/v3 focus).
+    /// Returns [`Error::Protocol`] for the legacy SNMPv1 Trap-PDU, which uses a
+    /// distinct `rasn-snmp::v1` structure; encode such a PDU via
+    /// [`Pdu::to_v1_rasn`] and wrap it in a `rasn_snmp::v1::Message` instead
+    /// (see [`crate::message::Message::encode`]).
     pub(crate) fn to_rasn(&self) -> Result<Pdus> {
         let variable_bindings = self
             .variables
@@ -326,14 +563,24 @@ impl Pdu {
             })),
             PduType::TrapV1 => {
                 return Err(Error::Protocol(
-                    "SNMPv1 Trap-PDU encoding is not supported".into(),
+                    "SNMPv1 Trap-PDU must be encoded via Pdu::to_v1_rasn / a v1 Message".into(),
                 ));
             }
         };
         Ok(pdus)
     }
 
-    /// Build a PDU from a decoded `rasn-snmp` PDU choice.
+    /// Convert an SNMPv1 Trap-PDU into the `rasn-snmp::v1::Trap` body. The caller
+    /// wraps this in a `rasn_snmp::v1::Message` for BER encoding.
+    pub(crate) fn to_v1_rasn(&self) -> Result<v1::Trap> {
+        let trap = self.v1_trap.as_ref().ok_or_else(|| {
+            Error::Protocol("v1 Trap-PDU is missing its V1Trap payload".into())
+        })?;
+        let bindings = varbinds_to_v1(&self.variables)?;
+        trap.to_rasn(bindings)
+    }
+
+    /// Build a PDU from a decoded `rasn-snmp` PDU choice (v2/v3 path).
     pub(crate) fn from_rasn(pdus: Pdus) -> Result<Pdu> {
         // Map the variant to (pdu_type, request_id, error_status/non_repeaters,
         // error_index/max_repetitions, bindings).
@@ -365,6 +612,21 @@ impl Pdu {
             error_status: status,
             error_index: index,
             variables,
+            v1_trap: None,
+        })
+    }
+
+    /// Build a v1 Trap-PDU from a decoded `rasn-snmp::v1::Trap` body.
+    pub(crate) fn from_v1_rasn(trap: v1::Trap) -> Result<Pdu> {
+        let (v1_trap, bindings) = V1Trap::from_rasn(trap)?;
+        let variables = varbinds_from_v1(bindings)?;
+        Ok(Pdu {
+            pdu_type: PduType::TrapV1,
+            request_id: 0,
+            error_status: 0,
+            error_index: 0,
+            variables,
+            v1_trap: Some(v1_trap),
         })
     }
 
@@ -416,6 +678,7 @@ mod tests {
                 "1.3.6.1.2.1.1.3.0".parse().unwrap(),
                 Value::TimeTicks(123456),
             )],
+            v1_trap: None,
         };
         assert_eq!(pdu_roundtrip_through_rasn(&pdu), pdu);
     }
@@ -435,5 +698,83 @@ mod tests {
         for code in 0..=18 {
             assert_eq!(ErrorStatus::from_code(code).code(), code);
         }
+    }
+
+    #[test]
+    fn v1_trap_roundtrip_through_message() {
+        // Encode a v1 Trap-PDU inside a v1 community message and decode it back,
+        // exercising the v1 codec path in Message::encode/decode.
+        let enterprise: Oid = "1.3.6.1.4.1.8072.2".parse().unwrap();
+        let trap = V1Trap::new(
+            enterprise.clone(),
+            std::net::Ipv4Addr::new(10, 0, 0, 1),
+            v1_generic_trap::ENTERPRISE_SPECIFIC,
+            42,
+            99,
+        );
+        let pdu = Pdu::new_v1_trap(
+            trap,
+            vec![VarBind::new(
+                "1.3.6.1.2.1.1.5.0".parse().unwrap(),
+                Value::OctetString(b"host-a".to_vec()),
+            )],
+        );
+        let msg = crate::message::Message::new(crate::message::Version::V1, b"public".to_vec(), pdu);
+        let bytes = msg.encode().unwrap();
+        let decoded = crate::message::Message::decode(&bytes).unwrap();
+        assert_eq!(decoded.version, crate::message::Version::V1);
+        assert_eq!(decoded.community, b"public");
+        assert_eq!(decoded.pdu.pdu_type, PduType::TrapV1);
+        let trap = decoded.pdu.v1_trap.expect("v1 trap payload");
+        assert_eq!(trap.enterprise, enterprise);
+        assert_eq!(trap.agent_addr, std::net::Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(trap.generic_trap, v1_generic_trap::ENTERPRISE_SPECIFIC);
+        assert_eq!(trap.specific_trap, 42);
+        assert_eq!(trap.time_stamp, 99);
+        assert_eq!(decoded.pdu.variables.len(), 1);
+        assert_eq!(
+            decoded.pdu.variables[0].value,
+            Value::OctetString(b"host-a".to_vec())
+        );
+    }
+
+    #[test]
+    fn v1_trap_matches_known_wire_bytes() {
+        // The canonical v1 Trap-PDU from rasn-snmp's own test suite (RFC 1157
+        // example): enterprise 1.3.6.1.4.1.11779.1.42.3.7.8, agent 10.11.12.13,
+        // generic 6, specific 2, uptime 11932, two varbinds.
+        #[rustfmt::skip]
+        let known: [u8; 0x51] = [
+            0x30, 0x4f,
+                0x02, 0x01, 0x00,
+                0x04, 0x06, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63,
+                0xa4, 0x42,
+                    0x06, 0x0c, 0x2b, 0x06, 0x01, 0x04, 0x01, 0xDC, 0x03, 0x01,
+                              0x2a, 0x03, 0x07, 0x08,
+                    0x40, 0x04, 0x0a, 0x0b, 0x0c, 0x0d,
+                    0x02, 0x01, 0x06,
+                    0x02, 0x01, 0x02,
+                    0x43, 0x02, 0x2e, 0x9c,
+                    0x30, 0x22,
+                        0x30, 0x0d,
+                            0x06, 0x07, 0x2b, 0x06, 0x01, 0x02, 0x01, 0x01, 0x03,
+                            0x43, 0x02, 0x2e, 0x9c,
+                        0x30, 0x11,
+                            0x06, 0x0c, 0x2b, 0x06, 0x01, 0x04, 0x01, 0xDC, 0x03,
+                                      0x01, 0x2a, 0x02, 0x01, 0x07,
+                            0x42, 0x01, 0x01,
+        ];
+        let decoded = crate::message::Message::decode(&known).unwrap();
+        assert_eq!(decoded.pdu.pdu_type, PduType::TrapV1);
+        let trap = decoded.pdu.v1_trap.as_ref().unwrap();
+        assert_eq!(trap.enterprise.to_string(), ".1.3.6.1.4.1.11779.1.42.3.7.8");
+        assert_eq!(trap.agent_addr, std::net::Ipv4Addr::new(10, 11, 12, 13));
+        assert_eq!(trap.generic_trap, 6);
+        assert_eq!(trap.specific_trap, 2);
+        assert_eq!(trap.time_stamp, 11_932);
+        assert_eq!(decoded.pdu.variables.len(), 2);
+        // Re-encoding yields identical bytes (round-trip stability).
+        let reencoded = decoded.encode().unwrap();
+        assert_eq!(reencoded, known);
     }
 }
